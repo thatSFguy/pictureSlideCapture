@@ -36,10 +36,12 @@ Options: `--port 8080`, `--out-dir ./captures`, `--prefix trip72`, `--no-setup`.
 
 ### Deploy as an appliance (Raspberry Pi Zero 2 W)
 
-Flash → boot → join WiFi (via an on-device AP the first time in a new place) →
-scan from any browser at `http://slidescanner.local:8080`. See
-[`deploy/DEPLOY.md`](deploy/DEPLOY.md); `deploy/setup_pi.sh` installs gphoto2,
-camera permissions, Comitup (WiFi provisioning), and the systemd service.
+Build a configured SD-card image **once** (`deploy/setup_pi.sh` installs gphoto2,
+camera permissions, Comitup for WiFi provisioning, and the systemd service),
+then it's **flash-and-go**: plug in the Pi → it raises a `slidescanner-XXXX`
+WiFi AP → enter your network → it reconnects → scan at
+`http://slidescanner.local:8080`. Full two-phase guide in
+[`deploy/DEPLOY.md`](deploy/DEPLOY.md).
 
 ## Using the app — three modes
 

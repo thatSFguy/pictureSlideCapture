@@ -1,98 +1,122 @@
 # Deploying on a Raspberry Pi Zero 2 W
 
-Turns a Pi Zero 2 W into a self-contained slide-scanner appliance: flash → boot →
-join WiFi (via an on-device AP the first time in a new place) → scan from any
-browser at `http://slidescanner.local:8080`.
+Goal — the appliance flow:
 
-> The Zero 2 W is adequate for this: the bottleneck is the camera's ~1.7 MB/s USB
-> transfer, not the Pi. The app is stdlib-only Python. Caveats handled in code:
-> the download-all zip streams (won't exhaust 512 MB RAM) and thumbnails read
-> only the file head. The exposure aid meters off the embedded JPEG thumbnail, so
-> it stays fast for JPEG and RAW+JPEG (the presets' defaults).
+> **Flash a card → plug the Pi in → it raises a WiFi AP → connect and enter your
+> network → it reconnects → scan at `http://slidescanner.local:8080`.**
+> No SSH, no config files, no scripts on the end card.
+
+There's a catch that shapes everything below: a blank card can't `apt install`
+Comitup/gphoto2 without a network. So this is **two phases**:
+
+- **Part A — build the appliance image, once.** Install everything on a Pi, then
+  save that card as a reusable image.
+- **Part B — flash that image and go.** This is the zero-config flow above, and
+  it's what you (or anyone) do from then on.
+
+> Why the Zero 2 W is fine: the bottleneck is the camera's ~1.7 MB/s USB
+> transfer, not the Pi. The app is stdlib-only Python. The zip download streams
+> and thumbnails read only the file head, so 512 MB RAM is enough.
 
 ## Hardware
 
-- Raspberry Pi Zero 2 W + a good micro-SD card (32 GB+; images live on it).
-- **micro-USB-OTG → USB-A adapter** for the camera (the Zero 2 W's data port is
-  micro-USB OTG). Power via the *separate* PWR port.
-- Canon camera on an **AC coupler** (not the battery), dial on **M**,
-  Communication set to **PC connection**, auto-power-off **disabled**.
+- Pi Zero 2 W + a good micro-SD (32 GB+; images live on it).
+- **micro-USB-OTG → USB-A adapter** for the camera (data port is micro-USB OTG);
+  power via the *separate* PWR port.
+- Camera on an **AC coupler**, dial on **M**, Communication = **PC connection**,
+  auto-power-off **disabled**.
 
-## 1. Flash the OS (with first-boot network for setup)
+---
 
-Use **Raspberry Pi Imager** → *Raspberry Pi OS Lite (64-bit, Bookworm)*. In the
-gear/OS-customisation:
+## Part A — Build the appliance image (done once)
 
-- Set **hostname** = `slidescanner`
-- Set a **username + password** (remember them)
-- Enable **SSH**
-- Set your **WiFi** SSID/password — needed for the *first* boot so setup can
-  install packages. (Comitup takes over WiFi afterwards for other locations.)
+You need a network *for this build only*. It won't be needed on the finished
+image.
 
-Flash, insert, power on, wait ~1–2 min for first boot.
+1. **Flash a build card.** Raspberry Pi Imager → *Raspberry Pi OS Lite (64-bit,
+   Bookworm)*. In OS customisation set: hostname `slidescanner`, a username +
+   password, enable **SSH**, and **your WiFi** (temporary — for the build).
 
-## 2. Copy the project onto the Pi
+2. **Get the project onto the Pi.** The GitHub repo is private, so from your
+   machine:
+   ```bash
+   scp -r pictureSlideCapture <user>@slidescanner.local:~/
+   ```
+   (or authenticate `git`/`gh` on the Pi and clone it.)
 
-The GitHub repo is **private**, so either:
+3. **Install everything:**
+   ```bash
+   ssh <user>@slidescanner.local
+   cd ~/pictureSlideCapture
+   sudo bash deploy/setup_pi.sh
+   ```
+   This installs gphoto2, the camera udev rule (+ `plugdev`), **Comitup**, the
+   hostname, and the `slidescanner` systemd service (port 8080).
 
-- **scp from your machine** (simplest):
-  ```bash
-  scp -r pictureSlideCapture <user>@slidescanner.local:~/
-  ```
-- **or** authenticate `git`/`gh` on the Pi and `git clone` it.
+4. **Verify** (plug the camera in, power it on):
+   ```bash
+   systemctl status slidescanner        # active?
+   gphoto2 --auto-detect                # camera seen?
+   ```
+   Browse from another device to `http://slidescanner.local:8080` and take a
+   test shot.
 
-## 3. Run the setup script
+5. **Make the image "clean"** so a fresh flash raises the AP instead of joining
+   the build WiFi. Remove the saved WiFi so no network is "known":
+   ```bash
+   nmcli -t -f NAME connection show                 # find your build SSID
+   sudo nmcli connection delete "<your-build-ssid>"
+   ```
+   (Optional tidy-up: `sudo apt clean`, `sudo journalctl --rotate --vacuum-time=1s`.)
+   Then shut down: `sudo shutdown -h now`.
 
-```bash
-ssh <user>@slidescanner.local
-cd ~/pictureSlideCapture
-sudo bash deploy/setup_pi.sh
-sudo reboot
-```
+6. **Capture the image.** Pull the card, put it in your computer, and save it:
+   - Linux/macOS: `sudo dd if=/dev/<card> of=slidescanner.img bs=4M status=progress`
+     (then optionally shrink with [PiShrink](https://github.com/Drewsif/PiShrink)).
+   - Or use Raspberry Pi Imager / Win32DiskImager "read" to a `.img`.
 
-`setup_pi.sh` installs gphoto2, the camera udev rule (+ adds you to `plugdev`),
-Comitup (WiFi provisioning), sets the hostname, and installs/enables the
-`slidescanner` systemd service on port 8080.
+   `slidescanner.img` is now your reusable appliance image.
 
-## 4. Use it
+---
 
-Plug the camera in (OTG adapter), power it on, then browse to:
+## Part B — Flash and go (the actual flow)
 
-```
-http://slidescanner.local:8080
-```
+1. **Flash** `slidescanner.img` to any card (Raspberry Pi Imager → *Use custom*).
+   No customisation, no WiFi — flash it as-is.
+2. **Plug in** the Pi (and the camera via the OTG adapter). Power on.
+3. **Join the AP.** With no known network, Comitup raises WiFi named
+   **`slidescanner-XXXX`**. On a phone/laptop, connect to it.
+4. **Set your network.** A portal opens (or browse to `http://10.41.0.1`); pick
+   your WiFi and enter the password. The Pi joins it and drops the AP.
+5. **Scan.** Reconnect your device to that same WiFi and open
+   **`http://slidescanner.local:8080`**.
+
+Moving it to a new place later? Same thing — it doesn't recognise the new WiFi,
+so it raises `slidescanner-XXXX` again; re-enter credentials.
+
+---
+
+## Everyday use
 
 Setup → pick Slides/Negatives, name the group, dial in the shutter with a Test
-shot, Start capturing. Offload finished batches with **Review → Download all
-(zip)**, then delete the group to free the SD card.
+shot, Start capturing. Offload with **Review → Download all (zip)**, then delete
+the group to free the SD card.
 
-## WiFi in a new location (the AP flow)
-
-If the Pi boots somewhere it doesn't recognise, Comitup raises a WiFi access
-point named **`slidescanner-XXXX`**. From a phone/laptop:
-
-1. Join the `slidescanner-XXXX` network.
-2. A portal opens (or browse to `http://10.41.0.1`); pick the WiFi and enter the
-   password.
-3. The Pi joins that network and drops the AP. Reconnect your device to the same
-   network and open `http://slidescanner.local:8080`.
-
-## Service management
+## Service management (on the Pi)
 
 ```bash
-systemctl status slidescanner        # is it running?
-journalctl -u slidescanner -f        # live logs
-sudo systemctl restart slidescanner  # after pulling new code
+systemctl status slidescanner
+journalctl -u slidescanner -f
+sudo systemctl restart slidescanner   # after updating code
 ```
 
 ## Notes / gotchas
 
-- **Ports:** the app is on **8080** because Comitup's portal owns port 80.
-- **Storage:** captures live in `~/captures` on the SD card. High-volume RAW
-  jobs fill space fast — offload via the zip and delete groups. (A USB stick via
-  a powered OTG hub is an option if you outgrow the card.)
-- **Comitup** can be finicky across OS revisions (it manages NetworkManager). If
-  the AP or reconnect misbehaves, see the Comitup docs — this script uses its
-  standard install and a minimal `/etc/comitup.conf`.
-- This guide/script were written without a Pi on hand to test — treat the first
-  run as a shakedown and expect a tweak or two.
+- **Port 8080** — Comitup's portal owns port 80, so the scanner URL carries
+  `:8080`.
+- **Storage** — captures live in `~/captures` on the SD card; offload + delete
+  for big RAW jobs (or add a USB stick via a powered OTG hub).
+- **Comitup** manages NetworkManager and can be finicky across OS revisions; if
+  the AP or reconnect misbehaves, check its docs. Confirm `nmcli device` shows
+  wlan0 managed.
+- Written without a Pi on hand to test — treat the first build as a shakedown.
