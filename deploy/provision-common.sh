@@ -4,7 +4,7 @@
 #   - deploy/provision-image.sh (CI, inside a Pi OS image under QEMU)
 # Source this after setting: REPO_DIR, TARGET_USER, OUT_DIR, PORT.  Run as root.
 
-PKGS="gphoto2 avahi-daemon wget"
+PKGS="gphoto2 avahi-daemon"
 
 pc_install_packages() {
   export DEBIAN_FRONTEND=noninteractive
@@ -14,13 +14,9 @@ pc_install_packages() {
 }
 
 pc_install_comitup() {
-  if ! command -v comitup >/dev/null 2>&1; then
-    local deb=/tmp/comitup-apt-source.deb
-    wget -qO "$deb" https://davesteele.github.io/comitup/deb/davesteele-comitup-apt-source_latest.deb
-    dpkg -i "$deb"
-    apt-get update
-    apt-get install -y comitup
-  fi
+  # comitup is in Debian main (bookworm+), so no external repo is needed.
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get install -y comitup
   cat >/etc/comitup.conf <<'EOF'
 # <nnnn> is replaced by Comitup with a unique number
 ap_name: slidescanner-<nnnn>
