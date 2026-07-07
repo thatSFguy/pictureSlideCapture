@@ -23,11 +23,12 @@ Stdlib only. Features:
 from __future__ import annotations
 
 import argparse
-import io
 import json
+import os
 import re
 import shutil
 import subprocess
+import tempfile
 import threading
 import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -484,9 +485,12 @@ class Handler(BaseHTTPRequestHandler):
         f = self._safe(name)
         if f is None or not f.is_file():
             return self._send(404 if f else 403, b"not found", "text/plain")
-        data = f.read_bytes()
-        thumb = jpegstats._find_thumbnail(data) if f.suffix.lower() in IMAGE_EXTS else None
-        self._send(200, thumb or data, "image/jpeg")
+        thumb = None
+        if f.suffix.lower() in IMAGE_EXTS:
+            with open(f, "rb") as fh:               # EXIF thumbnail lives early;
+                head = fh.read(131072)              # read 128 KB, not the whole file
+            thumb = jpegstats._find_thumbnail(head)
+        self._send(200, thumb or f.read_bytes(), "image/jpeg")
 
     def _delete(self, name: str):
         f = self._safe(name)
@@ -531,16 +535,38 @@ class Handler(BaseHTTPRequestHandler):
         self._json({"ok": True, "name": name, "caption": caption})
 
     def _serve_zip(self):
-        files = sorted(OUT_DIR.glob(f"{PREFIX}_*"))
-        files = [f for f in files if name_re(PREFIX).match(f.name)]
+        rx = name_re(PREFIX)
+        files = [f for f in sorted(OUT_DIR.glob(f"{PREFIX}_*")) if rx.match(f.name)]
         if not files:
             return self._send(404, b"no files in group", "text/plain")
-        buf = io.BytesIO()
-        with zipfile.ZipFile(buf, "w", zipfile.ZIP_STORED) as z:
-            for f in files:
-                z.write(f, f.name)
-        self._send(200, buf.getvalue(), "application/zip",
-                   {"Content-Disposition": f'attachment; filename="{PREFIX}.zip"'})
+        # Build to a temp file on the SAME disk (not /tmp, which is tmpfs/RAM on
+        # the Pi), then stream it — avoids buffering a whole batch in 512 MB RAM.
+        tmp = tempfile.NamedTemporaryFile(dir=OUT_DIR, suffix=".zip", delete=False)
+        try:
+            with zipfile.ZipFile(tmp, "w", zipfile.ZIP_STORED) as z:
+                for f in files:
+                    z.write(f, f.name)
+            size = tmp.tell()
+            tmp.seek(0)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/zip")
+            self.send_header("Content-Length", str(size))
+            self.send_header("Content-Disposition",
+                             f'attachment; filename="{PREFIX}.zip"')
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            if self.command != "HEAD":
+                while True:
+                    chunk = tmp.read(256 * 1024)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+        finally:
+            tmp.close()
+            try:
+                os.unlink(tmp.name)
+            except OSError:
+                pass
 
 
 # ---- the page (single embedded file) -------------------------------------

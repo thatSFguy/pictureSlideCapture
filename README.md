@@ -34,6 +34,13 @@ python3 capture_server.py            # then open http://localhost:8080
 
 Options: `--port 8080`, `--out-dir ./captures`, `--prefix trip72`, `--no-setup`.
 
+### Deploy as an appliance (Raspberry Pi Zero 2 W)
+
+Flash → boot → join WiFi (via an on-device AP the first time in a new place) →
+scan from any browser at `http://slidescanner.local:8080`. See
+[`deploy/DEPLOY.md`](deploy/DEPLOY.md); `deploy/setup_pi.sh` installs gphoto2,
+camera permissions, Comitup (WiFi provisioning), and the systemd service.
+
 ## Using the app — three modes
 
 - **Setup** (once per batch): pick **Slides** or **Negatives** preset, set a
@@ -87,6 +94,7 @@ correction.
 
 - [x] Camera tethering + full-res capture over USB
 - [x] Web capture app: presets, exposure aid, captions, review/cull, export
+- [x] Raspberry Pi appliance deploy kit (`deploy/`) — untested on hardware
 - [ ] Physical rig: light pad, film holder with registration, camera mount
-- [ ] Move the app to a Raspberry Pi for LAN access
+- [ ] First hardware shakedown of the Pi deploy (Comitup AP flow, real capture)
 - [ ] Automated XY gantry (GRBL) for hands-free batch scanning (`scanner.py`)
