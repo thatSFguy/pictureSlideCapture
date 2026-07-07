@@ -18,6 +18,21 @@ Comitup/gphoto2 without a network. So this is **two phases**:
 > transfer, not the Pi. The app is stdlib-only Python. The zip download streams
 > and thumbnails read only the file head, so 512 MB RAM is enough.
 
+## Getting the appliance image
+
+Two ways to produce the `slidescanner.img`:
+
+- **CI (recommended).** GitHub Actions builds it for you — see
+  [`.github/workflows/build-image.yml`](../.github/workflows/build-image.yml).
+  Run it manually (*Actions → Build Pi image → Run workflow*) to get a
+  build artifact, or push a `v*` **tag** to attach the compressed image to a
+  **Release**. The repo (and your app) are baked in, so there's no private-repo
+  copy step. **Set the repo Actions variable `SSH_AUTHORIZED_KEYS`** to your
+  public key(s) first (*Settings → Secrets and variables → Actions → Variables*)
+  — the appliance's `scanner` user is **key-only**; without it you can't SSH in.
+  Then jump to **Part B**.
+- **Locally**, following **Part A** below.
+
 ## Hardware
 
 - Pi Zero 2 W + a good micro-SD (32 GB+; images live on it).

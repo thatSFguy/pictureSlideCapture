@@ -10,6 +10,9 @@ __pycache__/
 *.bak
 scratchpad/
 
+# CI-staged SSH public key (injected from the SSH_AUTHORIZED_KEYS repo variable)
+deploy/authorized_keys
+
 # OS / editor
 .DS_Store
 *.swp

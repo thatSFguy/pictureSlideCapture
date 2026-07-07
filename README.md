@@ -97,6 +97,7 @@ correction.
 - [x] Camera tethering + full-res capture over USB
 - [x] Web capture app: presets, exposure aid, captions, review/cull, export
 - [x] Raspberry Pi appliance deploy kit (`deploy/`) — untested on hardware
+- [x] CI image build (GitHub Actions → flashable `.img` on tag/Release)
 - [ ] Physical rig: light pad, film holder with registration, camera mount
 - [ ] First hardware shakedown of the Pi deploy (Comitup AP flow, real capture)
 - [ ] Automated XY gantry (GRBL) for hands-free batch scanning (`scanner.py`)
