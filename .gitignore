@@ -1,0 +1,15 @@
+# Captured images + per-group sidecars (user data, not code)
+captures/
+*.cr2
+
+# Python
+__pycache__/
+*.pyc
+
+# Backups / scratch
+*.bak
+scratchpad/
+
+# OS / editor
+.DS_Store
+*.swp
