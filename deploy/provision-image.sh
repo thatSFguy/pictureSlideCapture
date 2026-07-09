@@ -58,6 +58,19 @@ fi
 
 echo ">>> app + captures dir..."
 install -d -o "$TARGET_USER" -g "$TARGET_USER" "$OUT_DIR"
+
+echo ">>> point app repo at public origin + fetch tags (for in-app self-update)..."
+REPO_URL="https://github.com/thatSFguy/pictureSlideCapture.git"
+git config --system --add safe.directory "$REPO_DIR" 2>/dev/null || true
+if git -C "$REPO_DIR" rev-parse --git-dir >/dev/null 2>&1; then
+  git -C "$REPO_DIR" remote set-url origin "$REPO_URL" 2>/dev/null \
+    || git -C "$REPO_DIR" remote add origin "$REPO_URL"
+else
+  rm -rf "$REPO_DIR"; git clone "$REPO_URL" "$REPO_DIR"
+fi
+git -C "$REPO_DIR" fetch --tags --force origin \
+  || echo "   (tag fetch failed now; self-update will fetch on first check)"
+
 chown -R root:root "$REPO_DIR"        # app read-only; service runs as $TARGET_USER
 
 echo ">>> service..."; pc_install_service

@@ -1,11 +1,17 @@
 # Film Scanning Rig
 
+> ## ⚠️ Alpha
+> Early and under active development. It works end-to-end on the author's setup
+> (Canon EOS 400D on a Raspberry Pi Zero W), but it's been tested on exactly one
+> camera and rig, has **no authentication** (designed for a trusted home LAN),
+> and interfaces may change. Use at your own risk; expect rough edges.
+
 Digitize 35mm slides and negatives with a tethered Canon DSLR — a web app you
 drive from any browser to place a slide, capture it, and review the batch.
 
-> **Status:** manual capture app is working; the automated XY gantry is
-> deferred until the manual workflow is proven. See [CLAUDE.md](CLAUDE.md) for
-> detailed hardware/dev notes.
+> **Status:** manual capture app is working (including a Raspberry Pi flash-and-go
+> appliance with in-app updates); the automated XY gantry is deferred until the
+> manual workflow is proven. See [CLAUDE.md](CLAUDE.md) for hardware/dev notes.
 
 ## What it is
 
@@ -42,6 +48,18 @@ then it's **flash-and-go**: plug in the Pi → it raises a `slidescanner-XXXX`
 WiFi AP → enter your network → it reconnects → scan at
 `http://slidescanner.local:8080`. Full two-phase guide in
 [`deploy/DEPLOY.md`](deploy/DEPLOY.md).
+
+Prebuilt appliance images are attached to
+[Releases](https://github.com/thatSFguy/pictureSlideCapture/releases) — flash the
+latest `slidescanner-*-armhf.img.xz` with Raspberry Pi Imager (32-bit, boots
+both the Pi Zero W and Zero 2 W).
+
+### Updating
+
+Once deployed, update from the browser: **Setup → System → Check for updates**.
+It pulls the latest **release tag** and restarts — no SSH, no reflash. (This
+updates the *app* only; changes to the OS image or provisioning still need a new
+flashed image.) Requires the Pi to have internet access.
 
 ## Using the app — three modes
 
@@ -103,7 +121,7 @@ correction.
       gated on cost for a private repo, so revisit when public
 - [ ] Physical rig: light pad, film holder with registration, camera mount
 - [ ] First hardware shakedown of the Pi deploy (Comitup AP flow, real capture)
-- [ ] Web-based self-update: a button in the UI that pulls the latest release
+- [x] Web-based self-update: a button in the UI that pulls the latest release
       and restarts the service (no SSH needed on the appliance)
 - [ ] Security hardening before going public: attack-surface review of the web
       app, remove SSH from the appliance (reflash-on-failure is the recovery

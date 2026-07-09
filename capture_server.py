@@ -441,6 +441,85 @@ def read_images(offset: int, limit: int) -> dict:
             "limit": limit, "items": items}
 
 
+# ---- self-update (git-based; updates the app only, not the OS) -------------
+APP_DIR = Path(__file__).resolve().parent
+SERVICE_NAME = "slidescanner"
+UPDATE_URL = "https://github.com/thatSFguy/pictureSlideCapture"
+
+
+def _git(args: list[str], timeout: float = 90.0) -> str:
+    """Run git in the app repo. Uses `sudo -n` when the repo isn't writable by
+    us — the Pi runs the app as an unprivileged user against a root-owned repo,
+    and the appliance user has passwordless sudo. Raises RuntimeError on error."""
+    prefix = [] if os.access(str(APP_DIR / ".git"), os.W_OK) else ["sudo", "-n"]
+    try:
+        r = subprocess.run(prefix + ["git", "-C", str(APP_DIR), *args],
+                           capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise RuntimeError(str(e))
+    if r.returncode != 0:
+        raise RuntimeError((r.stderr or r.stdout or "git failed").strip())
+    return r.stdout.strip()
+
+
+def _git_ok(args: list[str], timeout: float = 30.0) -> bool:
+    """Run git for its exit status only (no raise) — e.g. is-ancestor tests."""
+    prefix = [] if os.access(str(APP_DIR / ".git"), os.W_OK) else ["sudo", "-n"]
+    try:
+        r = subprocess.run(prefix + ["git", "-C", str(APP_DIR), *args],
+                           capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return r.returncode == 0
+
+
+def app_version() -> str:
+    try:
+        return _git(["describe", "--tags", "--always", "--dirty"])
+    except Exception:
+        return "unknown"
+
+
+def _current_tag() -> str | None:
+    try:
+        return _git(["describe", "--tags", "--exact-match"])
+    except Exception:
+        return None
+
+
+def update_check() -> dict:
+    """Fetch tags and report whether a newer release tag exists (needs net)."""
+    _git(["fetch", "--tags", "--force", "--quiet", "origin"], timeout=60)
+    tags = _git(["tag", "--list", "v*", "--sort=-v:refname"])
+    latest = tags.splitlines()[0].strip() if tags else None
+    cur = _current_tag()
+    # "available" only if HEAD doesn't already contain the latest tag — avoids
+    # nagging a build that's on or ahead of it (e.g. an untagged dev commit).
+    available = bool(latest) and not _git_ok(
+        ["merge-base", "--is-ancestor", latest, "HEAD"])
+    return {"ok": True, "current": app_version(), "current_tag": cur,
+            "latest": latest, "available": available, "url": UPDATE_URL}
+
+
+def update_apply() -> dict:
+    """Check out the latest release tag, then restart the service."""
+    info = update_check()
+    latest = info["latest"]
+    if not latest:
+        return {"ok": False, "error": "no release tags found on origin"}
+    if not info["available"]:
+        return {"ok": False, "current": info["current"],
+                "error": f"already up to date ({info['current']})"}
+    _git(["checkout", "--force", latest], timeout=60)
+    threading.Timer(1.2, _restart_service).start()   # let this response flush
+    return {"ok": True, "from": info["current"], "to": latest, "restarting": True}
+
+
+def _restart_service() -> None:
+    subprocess.run(["sudo", "-n", "systemctl", "restart", SERVICE_NAME],
+                   capture_output=True, text=True)
+
+
 # ---- HTTP handler ---------------------------------------------------------
 
 class Handler(BaseHTTPRequestHandler):
@@ -481,6 +560,18 @@ class Handler(BaseHTTPRequestHandler):
         finally:
             cam_lock.release()
 
+    def _guarded_update(self, check_only: bool):
+        # Serialize against capture (same lock) so we never restart mid-shot.
+        if not cam_lock.acquire(blocking=False):
+            return self._json({"ok": False, "busy": True,
+                               "error": "busy — finish the capture first"}, 409)
+        try:
+            self._json(update_check() if check_only else update_apply())
+        except Exception as e:
+            self._json({"ok": False, "error": str(e)}, 500)
+        finally:
+            cam_lock.release()
+
     def do_GET(self):
         u = urlparse(self.path)
         path, q = u.path, parse_qs(u.query)
@@ -492,6 +583,10 @@ class Handler(BaseHTTPRequestHandler):
             self._with_camera(read_settings)
         elif path == "/api/zip":
             self._serve_zip()
+        elif path == "/api/version":
+            self._json({"version": app_version()})
+        elif path == "/api/update":
+            self._guarded_update(check_only=True)
         elif path == "/api/exposure":
             f = self._safe(unquote(q.get("name", [""])[0]))
             stats = jpegstats.luma_stats(f) if f and f.is_file() else None
@@ -518,6 +613,8 @@ class Handler(BaseHTTPRequestHandler):
             self._with_camera(do_test)
         elif path == "/api/advance":
             self._with_camera(do_advance)   # lock: never advance mid-capture
+        elif path == "/api/update":
+            self._guarded_update(check_only=False)
         elif path == "/api/settings":
             body = self._body()
             self._with_camera(lambda: apply_settings(body))
@@ -798,6 +895,10 @@ INDEX_HTML = r"""<!doctype html>
     </div>
     <button id="startCap">Start capturing →</button>
     <div class="note" id="metaNote"></div>
+    <label>System</label>
+    <div class="note">Version <code id="appVer">…</code>
+      <button id="checkUpd" style="margin-left:.5rem">Check for updates</button>
+      <div id="updMsg" style="margin-top:.45rem"></div></div>
   </section>
 
   <!-- CAPTURE -->
@@ -873,7 +974,7 @@ function setMode(m){
   document.querySelectorAll('.view').forEach(v=>v.classList.remove('active'));
   $('#view-'+m).classList.add('active');
   document.querySelectorAll('nav button').forEach(b=>b.classList.toggle('active',b.dataset.mode===m));
-  if(m==='setup') loadSettings();
+  if(m==='setup'){ loadSettings(); loadVersion(); }
   if(m==='review') loadReview(true);
   if(m==='capture'){ capIdx=0; renderCap(); }
 }
@@ -964,6 +1065,37 @@ async function testShot(){
   if(d.exposure) chipFor($('#testChip'), d.exposure.status);
 }
 
+/* ---- self-update ---- */
+async function loadVersion(){
+  try{ const d=await jget('/api/version'); $('#appVer').textContent=d.version||'?'; }
+  catch(e){ $('#appVer').textContent='?'; }
+}
+async function checkUpdate(){
+  const m=$('#updMsg'); m.textContent='Checking…';
+  let d; try{ d=await jget('/api/update'); }catch(e){ m.textContent='Check failed (no network?).'; return; }
+  if(d.busy){ m.textContent='Busy — finish the current capture first.'; return; }
+  if(d.ok===false){ m.textContent=d.error||'Check failed.'; return; }
+  if(!d.available){ m.textContent='Up to date ('+(d.current||'?')+').'; return; }
+  m.innerHTML='Update available: <b>'+d.latest+'</b> — you have '+(d.current||'?')+'. ';
+  const b=document.createElement('button'); b.textContent='Update & restart';
+  b.onclick=()=>applyUpdate(d.latest); m.appendChild(b);
+}
+async function applyUpdate(to){
+  if(!confirm('Update to '+to+' and restart? The app will be briefly unavailable.')) return;
+  const m=$('#updMsg'); m.textContent='Updating to '+to+'… the app will restart.';
+  let d=null; try{ d=await jpost('/api/update',{}); }catch(e){ /* server may drop as it restarts */ }
+  if(d && d.ok===false && !d.restarting){ m.textContent=d.error||'Update failed.'; return; }
+  let tries=0;                                   // poll until it's back on the new version
+  const iv=setInterval(async()=>{
+    tries++;
+    try{ const v=await jget('/api/version');
+      if(v.version && v.version.indexOf(to)===0){ clearInterval(iv);
+        m.textContent='Updated to '+v.version+'. Reloading…'; setTimeout(()=>location.reload(),900); return; }
+    }catch(e){}
+    if(tries>40){ clearInterval(iv); m.textContent='Restarted — reload the page to confirm.'; }
+  }, 1500);
+}
+
 /* ---- review ---- */
 function eclass(st){ if(!st) return 'e-none'; if(st==='ok') return 'e-ok';
   if(st==='under'||st==='over') return 'e-bad'; return 'e-warn'; }
@@ -1011,6 +1143,7 @@ async function lbSave(){ const it=rev.items[rev.lbIdx]; if(!it) return;
 document.querySelectorAll('nav button').forEach(b=>b.onclick=()=>setMode(b.dataset.mode));
 $('#p-slides').onclick=()=>preset('slides'); $('#p-negatives').onclick=()=>preset('negatives');
 $('#applyPrefix').onclick=applyPrefix; $('#testShot').onclick=testShot;
+$('#checkUpd').onclick=checkUpdate;
 $('#startCap').onclick=()=>setMode('capture');
 $('#shoot').onclick=capture; $('#redo').onclick=redoLast;
 $('#revRefresh').onclick=()=>loadReview(true); $('#flagOnly').onchange=renderGrid;

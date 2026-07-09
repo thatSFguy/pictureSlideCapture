@@ -175,6 +175,11 @@ Files (all in repo root, stdlib only):
     exposure; returns exposure stats
   - `POST /api/advance` — manually advance one slide (test button; no-op error
     when auto-advance mode is `off`)
+  - `GET /api/version` — current app version (`git describe`)
+  - `GET /api/update` — check origin for a newer release tag; `POST /api/update`
+    — check out the latest tag + restart the service (in-app self-update; git +
+    passwordless sudo on the appliance; serialized behind the camera lock so it
+    never restarts mid-capture). Repo is **public** so the Pi pulls with no creds.
   - `POST /api/preset` — apply a quick preset (`slides` | `negatives`)
   - `POST /api/caption` — set/clear a per-image caption
   - `POST /api/delete` — delete an image and its RAW sibling (name-guarded)
