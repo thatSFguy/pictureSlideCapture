@@ -365,6 +365,68 @@ def do_test() -> dict:
     return {"ok": True, "name": jpg.name, "exposure": jpegstats.luma_stats(jpg)}
 
 
+def _shutter_seconds(s: str):
+    """Parse a shutter label ('1/30', '0.5', '4') to seconds; None if not a
+    plain speed (bulb/auto/blank)."""
+    s = (s or "").strip().lower()
+    if not s or s in ("bulb", "auto"):
+        return None
+    try:
+        if "/" in s:
+            a, b = s.split("/", 1)
+            return float(a) / float(b)
+        return float(s)
+    except (ValueError, ZeroDivisionError):
+        return None
+
+
+def auto_expose(max_steps: int = 6) -> dict:
+    """Dial in the shutter automatically: shoot a test, read the exposure aid,
+    step the shutter one stop brighter (longer) if dark / darker (shorter) if
+    over, and repeat until the verdict is 'ok' (or we hit a limit/edge). Leaves
+    the camera on the chosen shutter. Assumes cam_lock held.
+
+    Note: the exposure aid meters the whole frame, so a wide black slide-mount
+    border biases it dark — tighten framing for best results."""
+    full = cam.get_config_full(["shutterspeed"]).get("shutterspeed", {})
+    ladder = sorted(((sec, c) for c in full.get("choices", [])
+                     if (sec := _shutter_seconds(c)) is not None),
+                    key=lambda x: x[0])
+    labels = [c for _, c in ladder]
+    if len(labels) < 2:
+        return {"ok": False, "error": "shutter isn't adjustable — is the mode "
+                "dial on M?"}
+    current = full.get("current", "")
+    if current in labels:
+        idx = labels.index(current)
+    else:                                          # start from the nearest speed
+        cs = _shutter_seconds(current) or ladder[0][0]
+        idx = min(range(len(ladder)), key=lambda i: abs(ladder[i][0] - cs))
+    steps, tested, status = [], set(), None
+    for _ in range(max_steps):
+        jpg, _r, _d = _grab("_test")
+        stats = jpegstats.luma_stats(jpg) or {}
+        status = stats.get("status")
+        steps.append({"shutter": labels[idx], "mean": stats.get("mean"),
+                      "status": status})
+        tested.add(idx)
+        if status == "ok" or status is None:
+            break
+        if status in ("dark", "under"):
+            nxt = idx + 1                          # longer exposure -> brighter
+        elif status in ("over", "bright"):
+            nxt = idx - 1                          # shorter -> darker
+        else:
+            break
+        if not (0 <= nxt < len(labels)) or nxt in tested:
+            break                                  # at an edge, or oscillating
+        idx = nxt
+        cam.configure({"shutterspeed": labels[idx]})
+    return {"ok": True, "final_shutter": labels[idx], "status": status,
+            "steps": steps, "name": "_test.jpg",
+            "exposure": jpegstats.luma_stats(OUT_DIR / "_test.jpg")}
+
+
 def read_status() -> dict:
     """Light status: one batched gphoto2 call. Assumes cam_lock held."""
     try:
@@ -735,6 +797,8 @@ class Handler(BaseHTTPRequestHandler):
             self._with_camera(do_capture)
         elif path == "/api/test":
             self._with_camera(do_test)
+        elif path == "/api/autoexpose":
+            self._with_camera(auto_expose, wait=10)   # multi-shot; holds lock
         elif path == "/api/advance":
             self._with_camera(do_advance)   # lock: never advance mid-capture
         elif path == "/api/debugcapture":
@@ -912,9 +976,10 @@ INDEX_HTML = r"""<!doctype html>
            border:none; border-radius:12px; color:#fff; cursor:pointer; }
   #p-slides{background:#2f8f5a} #p-negatives{background:#a9642e}
   .row { display:flex; gap:.5rem; } .row input{flex:1}
-  .row button, #testShot, #checkUpd, #startCap { border:none; border-radius:8px; color:#fff;
-           background:#2f7bd6; padding:.55rem .9rem; cursor:pointer; font-size:.9rem; }
+  .row button, #testShot, #autoExp, #checkUpd, #startCap { border:none; border-radius:8px;
+           color:#fff; background:#2f7bd6; padding:.55rem .9rem; cursor:pointer; font-size:.9rem; }
   #testShot { width:100%; padding:.75rem; font-weight:600; }
+  #autoExp { width:100%; padding:.7rem; margin-top:.4rem; font-weight:600; background:#6a4ea9; }
   #checkUpd { margin-left:.5rem; background:#333; }
   #startCap { width:100%; padding:1rem; font-size:1.1rem; font-weight:700; margin-top:1.3rem; }
   #testWrap { margin-top:.2rem; background:#0c0c0c; border:1px solid #222;
@@ -1046,7 +1111,9 @@ INDEX_HTML = r"""<!doctype html>
         <h3>4 · Test shot</h3>
         <div id="testWrap">
           <button id="testShot">📸 Take test shot</button>
-          <div class="note" id="testMsg">Take a throwaway shot to check exposure (not counted).</div>
+          <button id="autoExp">✨ Auto-exposure</button>
+          <div class="note" id="testMsg">Take a throwaway shot to check exposure (not counted),
+            or let Auto-exposure dial in the shutter for you.</div>
           <img id="testImg" alt="test shot">
           <div id="testChip" class="pill" style="display:none;margin-top:.4rem"></div>
         </div>
@@ -1232,6 +1299,20 @@ async function testShot(){
   const im=$('#testImg'); im.src='/media/'+d.name+'?t='+Date.now(); im.style.display='inline-block';
   if(d.exposure) chipFor($('#testChip'), d.exposure.status);
 }
+async function autoExpose(){
+  $('#testMsg').textContent='Auto-exposing… taking a few test shots'; $('#testChip').style.display='none';
+  $('#autoExp').disabled=true; $('#testShot').disabled=true;
+  try{
+    const d=await jpost('/api/autoexpose');
+    if(!d.ok){ $('#testMsg').textContent=d.error||'auto-exposure failed'; toast(d.error||'failed','err'); return; }
+    const im=$('#testImg'); im.src='/media/'+d.name+'?t='+Date.now(); im.style.display='inline-block';
+    if(d.exposure) chipFor($('#testChip'), d.exposure.status);
+    $('#testMsg').textContent='Auto-exposure: shutter '+d.final_shutter+' — '+(d.status||'?')
+      +' (tried '+d.steps.map(s=>s.shutter).join(' → ')+')';
+    loadSettings();                                  // refresh the shutter dropdown
+  }catch(e){ $('#testMsg').textContent='auto-exposure failed (network)'; }
+  finally{ $('#autoExp').disabled=false; $('#testShot').disabled=false; }
+}
 
 /* ---- self-update ---- */
 async function loadVersion(){
@@ -1324,6 +1405,7 @@ async function lbSave(){ const it=rev.items[rev.lbIdx]; if(!it) return;
 document.querySelectorAll('nav button').forEach(b=>b.onclick=()=>setMode(b.dataset.mode));
 $('#p-slides').onclick=()=>preset('slides'); $('#p-negatives').onclick=()=>preset('negatives');
 $('#applyPrefix').onclick=applyPrefix; $('#testShot').onclick=testShot;
+$('#autoExp').onclick=autoExpose;
 $('#checkUpd').onclick=checkUpdate;
 $('#diagBtn').onclick=showDiag; $('#logBtn').onclick=showLogs;
 $('#startCap').onclick=()=>setMode('capture');
