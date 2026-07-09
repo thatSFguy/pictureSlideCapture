@@ -163,14 +163,22 @@ class Camera:
         if args:
             self._run(args)
 
-    def capture(self, dest: Path) -> Path:
+    def capture(self, dest: Path, capturetarget: str = "Memory card") -> Path:
         """Trigger, download to `dest` (may create sibling files for RAW+JPEG),
         delete from card. `dest` may use gphoto2's %C extension token.
-        Returns the primary path written."""
+        Returns the primary path written.
+
+        capturetarget is set in the SAME gphoto2 invocation as the capture, on
+        purpose: setting it in a separate command re-enumerates the 400D and
+        resets it back to Internal RAM, so the next (separate) capture shoots to
+        RAM and downloads nothing. One session avoids that reset; on a retry the
+        set is a no-op (already correct) so it can't loop. Pass capturetarget=""
+        to skip setting it."""
         dest.parent.mkdir(parents=True, exist_ok=True)
-        self._run([
-            "--capture-image-and-download",
-            "--filename", str(dest),
-            "--force-overwrite",
-        ], timeout=90.0)
+        args: list[str] = []
+        if capturetarget:
+            args += ["--set-config-value", f"capturetarget={capturetarget}"]
+        args += ["--capture-image-and-download", "--filename", str(dest),
+                 "--force-overwrite"]
+        self._run(args, timeout=90.0)
         return dest

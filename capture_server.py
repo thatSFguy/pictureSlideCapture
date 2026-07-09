@@ -40,7 +40,9 @@ from advance import ADVANCE_DEFAULTS, AdvanceError, make_advancer
 from camera import Camera, CameraError
 
 # ---- configuration (edit freely) -----------------------------------------
-STARTUP_SETTINGS = {"capturetarget": "Memory card", "imageformat": "L"}
+# capturetarget is set per-capture inside cam.capture() (avoids the 400D
+# re-enumeration reset), so startup only needs to pick the default format.
+STARTUP_SETTINGS = {"imageformat": "L"}
 EXPOSURE_KEYS = ["iso", "aperture", "shutterspeed", "whitebalance", "imageformat"]
 
 # Quick-start presets. ISO/aperture/WB/format are sane fixed choices; shutter is
@@ -282,38 +284,16 @@ def _wipe(stem_glob: str) -> None:
             pass
 
 
-_target_applied = False        # capturetarget set once per camera session
-
-
-def ensure_capture_target() -> None:
-    """Set capturetarget=Memory card once per session. Assumes lock held.
-
-    On the Pi appliance the service starts at boot, BEFORE the camera is
-    plugged in, so the boot-time STARTUP_SETTINGS never applied and the 400D
-    defaults to Internal RAM (sdram) — which captures but yields no
-    downloadable file ("captured but no displayable image"). Apply it lazily on
-    the first capture instead, and re-apply after any capture error (a
-    reconnect resets the camera's config). Only capturetarget is enforced here;
-    imageformat stays user-controlled so presets/drawer choices aren't clobbered.
-    """
-    global _target_applied
-    if _target_applied:
-        return
-    cam.configure({"capturetarget": STARTUP_SETTINGS["capturetarget"]})
-    _target_applied = True
-
-
 def _grab(stem: str) -> tuple:
     """Capture to <stem>.<ext>, normalize case, derive a preview if RAW-only.
-    Returns (jpg, raw, derived) or raises CameraError. Assumes cam_lock held."""
-    global _target_applied
-    ensure_capture_target()                        # sdram default -> no file
+    Returns (jpg, raw, derived) or raises CameraError. Assumes cam_lock held.
+    capturetarget=Memory card is set inside cam.capture() (same gphoto2 session)
+    so the 400D can't re-enumerate back to Internal RAM between set and shot."""
     glob = f"{stem}.*"
     _wipe(glob)                                    # clear any prior file at stem
     try:
         cam.capture(OUT_DIR / f"{stem}.%C")
     except CameraError:
-        _target_applied = False                    # reconnect may reset config
         _wipe(glob)
         raise
 
@@ -527,6 +507,52 @@ def _restart_service() -> None:
                    capture_output=True, text=True)
 
 
+# ---- diagnostics (in-app troubleshooting, no SSH needed) -------------------
+_DIAG_KEYS = ["capturetarget", "imageformat", "autoexposuremode",
+              "availableshots", "batterylevel"]
+
+
+def read_logs(lines: int = 300) -> dict:
+    """Tail the service journal for in-app troubleshooting on the appliance."""
+    n = max(20, min(2000, lines))
+    try:
+        r = subprocess.run(["sudo", "-n", "journalctl", "-u", SERVICE_NAME,
+                            "-n", str(n), "--no-pager", "-o", "short-iso"],
+                           capture_output=True, text=True, timeout=20)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return {"ok": False, "error": str(e)}
+    if r.returncode == 0:
+        return {"ok": True, "source": f"journalctl -u {SERVICE_NAME} -n {n}",
+                "text": r.stdout.strip() or "(no log lines)"}
+    return {"ok": False,
+            "error": (r.stderr or r.stdout or "journalctl unavailable").strip()}
+
+
+def read_diag() -> dict:
+    """System + live camera snapshot (incl. the actual capturetarget). Lock held."""
+    import platform
+    import sys
+    d = {"version": app_version(), "python": sys.version.split()[0],
+         "platform": platform.platform(), "out_dir": str(OUT_DIR.resolve()),
+         "prefix": PREFIX, "have_exiftool": HAVE_EXIFTOOL,
+         "advance_mode": ADVANCE.get("mode")}
+    try:
+        d["gphoto2"] = (subprocess.run(["gphoto2", "--version"],
+                        capture_output=True, text=True, timeout=10)
+                        .stdout.splitlines() or ["?"])[0]
+    except (OSError, subprocess.TimeoutExpired):
+        d["gphoto2"] = "?"
+    try:
+        full = cam.get_config_full(_DIAG_KEYS)
+        d["camera_connected"] = True
+        d["camera"] = {k: full.get(k, {}).get("current", "?") for k in _DIAG_KEYS}
+        d["capturetarget_choices"] = full.get("capturetarget", {}).get("choices", [])
+    except CameraError as e:
+        d["camera_connected"] = False
+        d["camera_error"] = friendly(str(e))
+    return d
+
+
 # ---- HTTP handler ---------------------------------------------------------
 
 class Handler(BaseHTTPRequestHandler):
@@ -594,6 +620,14 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"version": app_version()})
         elif path == "/api/update":
             self._guarded_update(check_only=True)
+        elif path == "/api/logs":
+            try:
+                n = int(q.get("lines", ["300"])[0])
+            except ValueError:
+                n = 300
+            self._json(read_logs(n))
+        elif path == "/api/diag":
+            self._with_camera(read_diag)   # camera snapshot needs the lock
         elif path == "/api/exposure":
             f = self._safe(unquote(q.get("name", [""])[0]))
             stats = jpegstats.luma_stats(f) if f and f.is_file() else None
@@ -803,6 +837,13 @@ INDEX_HTML = r"""<!doctype html>
   #testImg { max-width:100%; max-height:44vh; border-radius:6px; display:none; margin-top:.5rem; }
   .note { font-size:.72rem; color:#777; margin-top:.4rem; }
   .grid2 { display:grid; grid-template-columns:1fr 1fr; gap:.5rem; }
+  .diagrow { display:flex; gap:.5rem; flex-wrap:wrap; margin-top:.7rem; }
+  #diagBtn, #logBtn { background:#333; border:none; border-radius:8px; color:#fff;
+           padding:.5rem .8rem; cursor:pointer; font-size:.85rem; }
+  #diagOut { display:none; margin-top:.6rem; max-height:44vh; overflow:auto;
+           background:#0c0c0c; border:1px solid #262626; border-radius:8px;
+           padding:.6rem; font:12px/1.45 ui-monospace,Menlo,Consolas,monospace;
+           color:#cbd5e1; white-space:pre-wrap; word-break:break-word; }
 
   /* capture */
   #stage { flex:1; display:flex; align-items:center; justify-content:center;
@@ -931,6 +972,11 @@ INDEX_HTML = r"""<!doctype html>
           <button id="checkUpd">Check for updates</button>
           <div id="updMsg" style="margin-top:.45rem"></div></div>
         <div class="note" id="metaNote"></div>
+        <div class="diagrow">
+          <button id="diagBtn">Camera diagnostics</button>
+          <button id="logBtn">View logs</button>
+        </div>
+        <pre id="diagOut"></pre>
       </div>
      </div>
     </div>
@@ -1133,6 +1179,19 @@ async function applyUpdate(to){
   }, 1500);
 }
 
+/* ---- diagnostics ---- */
+async function showDiag(){
+  const o=$('#diagOut'); o.style.display='block'; o.textContent='Loading diagnostics…';
+  try{ o.textContent=JSON.stringify(await jget('/api/diag'),null,2); }
+  catch(e){ o.textContent='Failed to load diagnostics.'; }
+}
+async function showLogs(){
+  const o=$('#diagOut'); o.style.display='block'; o.textContent='Loading logs…';
+  try{ const d=await jget('/api/logs?lines=400');
+    o.textContent = d.ok ? d.text : ('logs unavailable: '+(d.error||'?')); }
+  catch(e){ o.textContent='Failed to load logs.'; }
+}
+
 /* ---- review ---- */
 function eclass(st){ if(!st) return 'e-none'; if(st==='ok') return 'e-ok';
   if(st==='under'||st==='over') return 'e-bad'; return 'e-warn'; }
@@ -1181,6 +1240,7 @@ document.querySelectorAll('nav button').forEach(b=>b.onclick=()=>setMode(b.datas
 $('#p-slides').onclick=()=>preset('slides'); $('#p-negatives').onclick=()=>preset('negatives');
 $('#applyPrefix').onclick=applyPrefix; $('#testShot').onclick=testShot;
 $('#checkUpd').onclick=checkUpdate;
+$('#diagBtn').onclick=showDiag; $('#logBtn').onclick=showLogs;
 $('#startCap').onclick=()=>setMode('capture');
 $('#shoot').onclick=capture; $('#redo').onclick=redoLast;
 $('#revRefresh').onclick=()=>loadReview(true); $('#flagOnly').onchange=renderGrid;
@@ -1235,7 +1295,6 @@ def main():
             print("Detecting camera...")
             print("  " + cam.detect().splitlines()[-1])
             cam.configure(STARTUP_SETTINGS)
-            globals()["_target_applied"] = True    # capturetarget applied here
             if not cam.is_manual():
                 print("  NOTE: dial not on M — exposure settings won't apply.")
         except CameraError as e:

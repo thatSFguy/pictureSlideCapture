@@ -180,6 +180,11 @@ Files (all in repo root, stdlib only):
     — check out the latest tag + restart the service (in-app self-update; git +
     passwordless sudo on the appliance; serialized behind the camera lock so it
     never restarts mid-capture). Repo is **public** so the Pi pulls with no creds.
+  - `GET /api/logs?lines=` — tail the systemd journal for `slidescanner` (via
+    `sudo journalctl`); in-app troubleshooting with no SSH
+  - `GET /api/diag` — system + live camera snapshot (version, gphoto2, and the
+    actual `capturetarget`/`imageformat`/mode/shots/battery). Surfaced in the UI
+    under **Setup → System** (Camera diagnostics / View logs).
   - `POST /api/preset` — apply a quick preset (`slides` | `negatives`)
   - `POST /api/caption` — set/clear a per-image caption
   - `POST /api/delete` — delete an image and its RAW sibling (name-guarded)
@@ -254,18 +259,19 @@ bypasses the server's camera lock and both fail with I/O errors. Change settings
 through the UI/API instead.
 
 Notes / gotchas learned:
-- **Appliance boot-order / capturetarget (found on the Pi 2026-07-09):** the
-  systemd service starts at boot, *before* the camera is plugged in, so the
-  one-shot boot-time `STARTUP_SETTINGS` (which sets `capturetarget=Memory card`)
-  never applied — the 400D then defaulted to Internal RAM (sdram), which
-  captures but returns no downloadable file → the UI error "captured but no
-  displayable image". Tell-tale: `availableshots` reads an absurd number
-  (e.g. 281082). Fixed by enforcing `capturetarget` LAZILY on the first capture
-  (`ensure_capture_target()`), re-applied after any capture error (reconnect
-  resets camera config); imageformat stays user-controlled. A CF card must be
-  inserted for the Memory-card target. (Quick field fix on an old build:
-  `sudo systemctl restart slidescanner` with the camera connected, or reboot
-  with it attached, so startup re-applies the target.)
+- **capturetarget re-enumeration trap (found on the Pi 2026-07-09):** the 400D
+  defaults to Internal RAM (sdram), which captures but returns NO downloadable
+  file → the UI error "captured but no displayable image". Setting capturetarget
+  in a SEPARATE gphoto2 command does NOT help: the act of changing it
+  re-enumerates the camera, which resets it back to sdram before the next
+  (separate) capture command runs. Fix: set `capturetarget=Memory card` in the
+  SAME gphoto2 invocation as the capture — `camera.capture()` prepends
+  `--set-config-value capturetarget=…`; on a retry the set is a no-op so it
+  can't loop. A CF card must be inserted. (A lazy `ensure_capture_target()`
+  that configured it as a separate step was tried first and failed for exactly
+  this reset reason — don't reintroduce it.) Tell-tale of sdram: `availableshots`
+  reads an absurd number (e.g. 281082); check the live value via
+  **Setup → System → Camera diagnostics** (`/api/diag`).
 - Camera must stay powered: it dropped off USB mid-session once (auto-power-off
   + Low battery). Disable auto-power-off; use the AC dummy-battery coupler.
 - Local browser on the dev machine uses `localhost:8080`. Reaching it from
