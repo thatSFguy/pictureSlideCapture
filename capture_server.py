@@ -744,6 +744,7 @@ INDEX_HTML = r"""<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>Slide Capture</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text x='50' y='80' font-size='82' text-anchor='middle'>🎞️</text></svg>">
 <style>
   :root { color-scheme: dark; }
   * { box-sizing: border-box; }
@@ -768,8 +769,16 @@ INDEX_HTML = r"""<!doctype html>
   .view.active { display:flex; }
 
   /* setup */
-  #view-setup { overflow-y:auto; padding:1rem; gap:.2rem; max-width:560px; width:100%; margin:0 auto; }
-  #view-setup label { display:block; font-size:.75rem; color:#aaa; margin:.8rem 0 .2rem; }
+  #view-setup { overflow-y:auto; padding:0; }
+  .setup-wrap { max-width:1060px; margin:0 auto; padding:1.3rem 1.3rem 2.2rem; }
+  .setup-grid { display:grid; gap:1rem; grid-template-columns:1fr 1fr; align-items:start; }
+  .setup-grid .col { display:flex; flex-direction:column; gap:1rem; min-width:0; }
+  @media (max-width:820px){ .setup-grid { grid-template-columns:1fr; } }
+  .card { background:#161616; border:1px solid #262626; border-radius:14px;
+          padding:.9rem 1.1rem 1.15rem; }
+  .card > h3 { margin:0 0 .5rem; font-size:.74rem; letter-spacing:.03em; color:#8ab4e8;
+               text-transform:uppercase; font-weight:700; }
+  #view-setup label { display:block; font-size:.75rem; color:#aaa; margin:.7rem 0 .2rem; }
   #view-setup select, #view-setup input { width:100%; padding:.55rem; background:#111;
            color:#eee; border:1px solid #333; border-radius:8px; font-size:.95rem; }
   .presetrow { display:flex; gap:.6rem; }
@@ -777,12 +786,14 @@ INDEX_HTML = r"""<!doctype html>
            border:none; border-radius:12px; color:#fff; cursor:pointer; }
   #p-slides{background:#2f8f5a} #p-negatives{background:#a9642e}
   .row { display:flex; gap:.5rem; } .row input{flex:1}
-  .row button, #testShot, #startCap { border:none; border-radius:8px; color:#fff;
+  .row button, #testShot, #checkUpd, #startCap { border:none; border-radius:8px; color:#fff;
            background:#2f7bd6; padding:.55rem .9rem; cursor:pointer; font-size:.9rem; }
-  #startCap { width:100%; padding:.9rem; font-size:1.05rem; font-weight:700; margin-top:1rem; }
-  #testWrap { margin-top:.8rem; background:#0c0c0c; border:1px solid #262626;
+  #testShot { width:100%; padding:.75rem; font-weight:600; }
+  #checkUpd { margin-left:.5rem; background:#333; }
+  #startCap { width:100%; padding:1rem; font-size:1.1rem; font-weight:700; margin-top:1.3rem; }
+  #testWrap { margin-top:.2rem; background:#0c0c0c; border:1px solid #222;
               border-radius:10px; padding:.6rem; text-align:center; }
-  #testImg { max-width:100%; max-height:34vh; border-radius:6px; display:none; }
+  #testImg { max-width:100%; max-height:44vh; border-radius:6px; display:none; margin-top:.5rem; }
   .note { font-size:.72rem; color:#777; margin-top:.4rem; }
   .grid2 { display:grid; grid-template-columns:1fr 1fr; gap:.5rem; }
 
@@ -864,41 +875,60 @@ INDEX_HTML = r"""<!doctype html>
 <main>
   <!-- SETUP -->
   <section id="view-setup" class="view">
-    <label>1 · Choose type</label>
-    <div class="presetrow">
-      <button id="p-slides">📽 Slides</button>
-      <button id="p-negatives">🎞 Negatives</button>
-    </div>
-    <div class="note">Slides → JPEG (fast). Negatives → RAW+JPEG (archival, for inversion).
-      Sets ISO 100, f/8, daylight WB.</div>
-    <label>2 · Group name (filename prefix)</label>
-    <div class="row">
-      <input id="prefix" placeholder="e.g. moms_slides_1972">
-      <button id="applyPrefix">Set</button>
-    </div>
-    <div class="note">Saved as <code><span id="pfxEx">slide</span>_0001</code>, _0002, …
-      (written into each image's metadata).</div>
-    <label>3 · Fine-tune exposure</label>
-    <div class="grid2">
-      <div><label>Format</label><select id="f-imageformat"></select></div>
-      <div><label>ISO</label><select id="f-iso"></select></div>
-      <div><label>Aperture</label><select id="f-aperture"></select></div>
-      <div><label>Shutter</label><select id="f-shutterspeed"></select></div>
-      <div><label>White balance</label><select id="f-whitebalance"></select></div>
-    </div>
-    <div class="note" id="expNote"></div>
-    <div id="testWrap">
-      <button id="testShot">📸 Test shot</button>
-      <div class="note" id="testMsg">Take a throwaway shot to check exposure (not counted).</div>
-      <img id="testImg" alt="test shot">
-      <div id="testChip" class="pill" style="display:none;margin-top:.4rem"></div>
+   <div class="setup-wrap">
+    <div class="setup-grid">
+     <div class="col">
+      <div class="card">
+        <h3>1 · Choose type</h3>
+        <div class="presetrow">
+          <button id="p-slides">📽 Slides</button>
+          <button id="p-negatives">🎞 Negatives</button>
+        </div>
+        <div class="note">Slides → JPEG (fast). Negatives → RAW+JPEG (archival, for inversion).
+          Sets ISO 100, f/8, daylight WB.</div>
+      </div>
+      <div class="card">
+        <h3>2 · Group name (filename prefix)</h3>
+        <div class="row">
+          <input id="prefix" placeholder="e.g. moms_slides_1972">
+          <button id="applyPrefix">Set</button>
+        </div>
+        <div class="note">Saved as <code><span id="pfxEx">slide</span>_0001</code>, _0002, …
+          (written into each image's metadata).</div>
+      </div>
+      <div class="card">
+        <h3>3 · Fine-tune exposure</h3>
+        <div class="grid2">
+          <div><label>Format</label><select id="f-imageformat"></select></div>
+          <div><label>ISO</label><select id="f-iso"></select></div>
+          <div><label>Aperture</label><select id="f-aperture"></select></div>
+          <div><label>Shutter</label><select id="f-shutterspeed"></select></div>
+          <div><label>White balance</label><select id="f-whitebalance"></select></div>
+        </div>
+        <div class="note" id="expNote"></div>
+      </div>
+     </div>
+     <div class="col">
+      <div class="card">
+        <h3>4 · Test shot</h3>
+        <div id="testWrap">
+          <button id="testShot">📸 Take test shot</button>
+          <div class="note" id="testMsg">Take a throwaway shot to check exposure (not counted).</div>
+          <img id="testImg" alt="test shot">
+          <div id="testChip" class="pill" style="display:none;margin-top:.4rem"></div>
+        </div>
+      </div>
+      <div class="card">
+        <h3>System</h3>
+        <div class="note">Version <code id="appVer">…</code>
+          <button id="checkUpd">Check for updates</button>
+          <div id="updMsg" style="margin-top:.45rem"></div></div>
+        <div class="note" id="metaNote"></div>
+      </div>
+     </div>
     </div>
     <button id="startCap">Start capturing →</button>
-    <div class="note" id="metaNote"></div>
-    <label>System</label>
-    <div class="note">Version <code id="appVer">…</code>
-      <button id="checkUpd" style="margin-left:.5rem">Check for updates</button>
-      <div id="updMsg" style="margin-top:.45rem"></div></div>
+   </div>
   </section>
 
   <!-- CAPTURE -->
