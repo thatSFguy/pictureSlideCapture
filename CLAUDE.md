@@ -169,9 +169,12 @@ Files (all in repo root, stdlib only):
   - `GET /api/settings` / `POST /api/settings` — exposure choices+current, and
     apply exposure (iso/aperture/shutterspeed/whitebalance/imageformat) and/or
     the group `prefix`
-  - `POST /api/capture` — capture into the current group (returns exposure stats)
+  - `POST /api/capture` — capture into the current group (returns exposure
+    stats; also auto-advances one slide when enabled — see `advance.py`)
   - `POST /api/test` — throwaway setup shot (`_test.*`, not counted) to dial in
     exposure; returns exposure stats
+  - `POST /api/advance` — manually advance one slide (test button; no-op error
+    when auto-advance mode is `off`)
   - `POST /api/preset` — apply a quick preset (`slides` | `negatives`)
   - `POST /api/caption` — set/clear a per-image caption
   - `POST /api/delete` — delete an image and its RAW sibling (name-guarded)
@@ -184,6 +187,16 @@ Files (all in repo root, stdlib only):
 - `jpegstats.py` — pure-stdlib JPEG luminance reader for the exposure aid;
   meters off the embedded EXIF thumbnail (fast) via a minimal baseline DC-only
   decoder, else the image. Returns mean/under/over + a status/advice, or None.
+- `advance.py` — auto slide-advance output (STUB). Settings-driven
+  (`ADVANCE_DEFAULTS`): `mode` = `off` (default, no-op `NullAdvancer`) | `motor`
+  (DC motor run until a stop/index switch trips, one pulse == one slide, via
+  libgpiod `gpioset`/`gpiomon`, subprocess pattern like gphoto2; jam-protected
+  by `timeout_s`) | `stepper` (fixed steps/slide — NOT implemented, points at
+  GRBL). `make_advancer(settings)` builds it; tool/hardware checks are deferred
+  to `advance()` time so the mode is selectable from any machine. `do_capture`
+  calls it after each capture when enabled (`after_capture`); a failed advance
+  is reported in the response, never fatal (image is already saved). Motor path
+  is written but UNTESTED on hardware — first run is a bring-up.
 - `scanner.py` — gantry batch loop (deferred phase), reuses `camera.py`.
 
 UI — three modes (built for high-volume, keyboard-first; see the redesign plan

@@ -36,6 +36,7 @@ from pathlib import Path
 from urllib.parse import unquote, urlparse, parse_qs
 
 import jpegstats
+from advance import ADVANCE_DEFAULTS, AdvanceError, make_advancer
 from camera import Camera, CameraError
 
 # ---- configuration (edit freely) -----------------------------------------
@@ -62,6 +63,30 @@ cam_lock = threading.Lock()          # camera is single-session: serialize acces
 OUT_DIR = Path("./captures")
 PREFIX = "slide"
 HAVE_EXIFTOOL = shutil.which("exiftool") is not None
+
+# Auto slide-advance output (stub; default "off" == no-op). See advance.py.
+ADVANCE = dict(ADVANCE_DEFAULTS)
+advancer = make_advancer(ADVANCE)
+
+
+def set_advance(cfg: dict) -> dict:
+    """Merge new advance settings and rebuild the advancer. Lock held.
+    Commits only if the new config builds — bad config raises AdvanceError
+    without corrupting the live advancer."""
+    global ADVANCE, advancer
+    merged = {**ADVANCE, **{k: cfg[k] for k in ADVANCE_DEFAULTS if k in cfg}}
+    new = make_advancer(merged)               # may raise AdvanceError
+    ADVANCE, advancer = merged, new
+    return ADVANCE
+
+
+def _advance_once() -> dict:
+    """Advance one slide, mapping failures to a result dict (never raises)."""
+    try:
+        advancer.advance()
+        return {"ok": True, "mode": advancer.mode}
+    except (AdvanceError, NotImplementedError) as e:
+        return {"ok": False, "error": str(e) or "advance not implemented"}
 
 
 def sanitize_prefix(s: str) -> str:
@@ -305,9 +330,20 @@ def do_capture() -> dict:
         ex = load_exposure()
         ex[jpg.name] = stats.get("status")
         save_exposure(ex)
+    # Auto-advance to the next slide (no-op unless enabled). The image is
+    # already saved, so a failed advance is reported, not fatal.
+    adv = _advance_once() if (advancer.enabled and ADVANCE.get("after_capture")) \
+        else None
     return {"ok": True, "name": jpg.name, "index": n, "count": image_count(prefix),
             "raw": raw.name if raw else None, "preview_from_raw": derived,
-            "exposure": stats}
+            "exposure": stats, "advance": adv}
+
+
+def do_advance() -> dict:
+    """Manual one-slide advance (test button / decoupled from capture)."""
+    if not advancer.enabled:
+        return {"ok": False, "error": "auto-advance is off"}
+    return _advance_once()
 
 
 def do_test() -> dict:
@@ -345,20 +381,29 @@ def read_settings() -> dict:
         full = cam.get_config_full(EXPOSURE_KEYS)
     except CameraError as e:
         return {"connected": False, "error": friendly(str(e)), "prefix": PREFIX,
-                "have_exiftool": HAVE_EXIFTOOL}
+                "have_exiftool": HAVE_EXIFTOOL, "advance": ADVANCE}
     return {"connected": True, "prefix": PREFIX, "fields": full,
-            "have_exiftool": HAVE_EXIFTOOL}
+            "have_exiftool": HAVE_EXIFTOOL, "advance": ADVANCE}
 
 
 def apply_settings(body: dict) -> dict:
-    """Apply exposure keys + prefix. Assumes cam_lock held."""
+    """Apply exposure keys + prefix + advance config. Assumes cam_lock held."""
     global PREFIX
     cam_settings = {k: str(body[k]) for k in EXPOSURE_KEYS if body.get(k)}
     if cam_settings:
         cam.configure(cam_settings)
     if "prefix" in body:
         PREFIX = sanitize_prefix(body["prefix"])
-    return read_settings()
+    adv_err = None
+    if isinstance(body.get("advance"), dict):
+        try:
+            set_advance(body["advance"])
+        except AdvanceError as e:
+            adv_err = str(e)                   # report, don't 500 or corrupt state
+    out = read_settings()
+    if adv_err:
+        out["advance_error"] = adv_err
+    return out
 
 
 def read_images(offset: int, limit: int) -> dict:
@@ -447,6 +492,8 @@ class Handler(BaseHTTPRequestHandler):
             self._with_camera(do_capture)
         elif path == "/api/test":
             self._with_camera(do_test)
+        elif path == "/api/advance":
+            self._with_camera(do_advance)   # lock: never advance mid-capture
         elif path == "/api/settings":
             body = self._body()
             self._with_camera(lambda: apply_settings(body))

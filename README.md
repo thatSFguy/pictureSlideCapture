@@ -80,6 +80,7 @@ exposure aid. Focus once, manually, on the film plane. Full rationale in
 | `capture_server.py` | The web app (HTTP server + embedded UI + all endpoints) |
 | `camera.py` | gphoto2 wrapper: detect, get/set config, capture, retries |
 | `jpegstats.py` | Pure-stdlib JPEG brightness reader for the exposure aid |
+| `advance.py` | Auto slide-advance output (stub): capture → advance → repeat, settings-driven (motor+switch / stepper); default off |
 | `scanner.py` | Gantry dead-reckoning batch loop (deferred automation phase) |
 | `CLAUDE.md` | Detailed hardware, protocol, and development notes |
 
@@ -112,4 +113,6 @@ correction.
       (`nmcli`/Comitup API) and drop `comitup-web`, so one service on one port
       does setup + scanning (also shrinks attack surface). Until then, an
       `slidescanner.local` QR-code bookmark hides the `:8080`.
+- [ ] Auto slide-advance (`advance.py`): stub + API done; needs hardware
+      bring-up (motor + stop-switch or stepper) and a UI toggle in Setup
 - [ ] Automated XY gantry (GRBL) for hands-free batch scanning (`scanner.py`)
