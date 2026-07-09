@@ -307,6 +307,19 @@ Notes / gotchas learned:
   the radio until one is set, so AP mode couldn't start). Still to verify on the
   Pi: web UI reachable at `slidescanner.local:8080`, camera detect + real
   capture over the OTG adapter.
+- [DONE 2026-07-09] **End-to-end capture working on the Pi Zero W appliance**
+  (v0.1.10): real slide captured, downloaded, and metered via the web UI over
+  WiFi. Journey: fixed Comitup AP (enable + WiFi country), self-update
+  (public repo + clean clone, no stale CI credential), and the capture bug —
+  which was NOT capturetarget or arg-order (both chased and wrong) but gphoto2
+  needing a **writable cwd** to stage the download (service ran from a
+  root-owned dir). Added in-app logs + `/api/diag` diagnostics, updater
+  validate/rollback, and a lock-wait to kill spurious "camera busy". Exposure:
+  ISO 100 / f8 / **1/30** gave a good slide off the light pad (1/60 was ~1 stop
+  dark). Self-update validated on hardware (v0.1.4→…→v0.1.10 via the button).
+- [TODO] Exposure/quality polish: tighter framing to drop the black mount
+  border (more resolution + accurate metering), optional custom WB off the
+  light pad (slides read slightly blue). Remove the temporary `/api/debugcapture`.
 - [DEFERRED] Automated gantry + `scanner.py` GRBL wiring.
 
 ## Open Items / Next Steps
