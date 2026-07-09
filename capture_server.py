@@ -447,14 +447,22 @@ SERVICE_NAME = "slidescanner"
 UPDATE_URL = "https://github.com/thatSFguy/pictureSlideCapture"
 
 
-def _git(args: list[str], timeout: float = 90.0) -> str:
-    """Run git in the app repo. Uses `sudo -n` when the repo isn't writable by
-    us — the Pi runs the app as an unprivileged user against a root-owned repo,
-    and the appliance user has passwordless sudo. Raises RuntimeError on error."""
+def _git_cmd(args: list[str]) -> list[str]:
+    """Build a git argv. Uses `sudo -n` when the repo isn't writable by us (the
+    Pi runs the app unprivileged against a root-owned repo; the appliance user
+    has passwordless sudo). `env GIT_TERMINAL_PROMPT=0` guarantees git never
+    blocks on a credential prompt — it fails fast instead (survives sudo's env
+    reset, unlike passing env= to subprocess)."""
     prefix = [] if os.access(str(APP_DIR / ".git"), os.W_OK) else ["sudo", "-n"]
+    return prefix + ["env", "GIT_TERMINAL_PROMPT=0",
+                     "git", "-C", str(APP_DIR), *args]
+
+
+def _git(args: list[str], timeout: float = 90.0) -> str:
+    """Run git in the app repo; raise RuntimeError on error."""
     try:
-        r = subprocess.run(prefix + ["git", "-C", str(APP_DIR), *args],
-                           capture_output=True, text=True, timeout=timeout)
+        r = subprocess.run(_git_cmd(args), capture_output=True, text=True,
+                           timeout=timeout)
     except (OSError, subprocess.TimeoutExpired) as e:
         raise RuntimeError(str(e))
     if r.returncode != 0:
@@ -464,10 +472,9 @@ def _git(args: list[str], timeout: float = 90.0) -> str:
 
 def _git_ok(args: list[str], timeout: float = 30.0) -> bool:
     """Run git for its exit status only (no raise) — e.g. is-ancestor tests."""
-    prefix = [] if os.access(str(APP_DIR / ".git"), os.W_OK) else ["sudo", "-n"]
     try:
-        r = subprocess.run(prefix + ["git", "-C", str(APP_DIR), *args],
-                           capture_output=True, text=True, timeout=timeout)
+        r = subprocess.run(_git_cmd(args), capture_output=True, text=True,
+                           timeout=timeout)
     except (OSError, subprocess.TimeoutExpired):
         return False
     return r.returncode == 0

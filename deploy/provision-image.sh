@@ -59,17 +59,29 @@ fi
 echo ">>> app + captures dir..."
 install -d -o "$TARGET_USER" -g "$TARGET_USER" "$OUT_DIR"
 
-echo ">>> point app repo at public origin + fetch tags (for in-app self-update)..."
+echo ">>> install app from a clean public clone (strips CI git credentials)..."
+# arm-runner copied the repo WITH the CI checkout's git config, which embeds a
+# now-expired GitHub auth token (http.<url>.extraheader). That stale token makes
+# runtime `git fetch` prompt for a username and fail. Re-clone the public repo
+# fresh so origin is clean + anonymous, then pin the exact built commit so the
+# image's code matches its tag.
 REPO_URL="https://github.com/thatSFguy/pictureSlideCapture.git"
-git config --system --add safe.directory "$REPO_DIR" 2>/dev/null || true
-if git -C "$REPO_DIR" rev-parse --git-dir >/dev/null 2>&1; then
-  git -C "$REPO_DIR" remote set-url origin "$REPO_URL" 2>/dev/null \
-    || git -C "$REPO_DIR" remote add origin "$REPO_URL"
+SHA="$(git -C "$REPO_DIR" rev-parse HEAD 2>/dev/null || true)"
+TMP="$(mktemp -d)"
+if git clone --quiet "$REPO_URL" "$TMP/app"; then
+  git -C "$TMP/app" fetch --tags --force --quiet origin || true
+  [ -n "$SHA" ] && git -C "$TMP/app" checkout --quiet "$SHA" 2>/dev/null \
+    || echo "   (couldn't pin $SHA; staying on default branch)"
+  rm -rf "$REPO_DIR"
+  mv "$TMP/app" "$REPO_DIR"
 else
-  rm -rf "$REPO_DIR"; git clone "$REPO_URL" "$REPO_DIR"
+  echo "   WARNING: clone failed (no network?); scrubbing CI credentials in place"
+  git -C "$REPO_DIR" remote set-url origin "$REPO_URL" 2>/dev/null || true
+  git -C "$REPO_DIR" config --local --remove-section 'http.https://github.com/' 2>/dev/null || true
+  git -C "$REPO_DIR" config --local --unset-all credential.helper 2>/dev/null || true
+  rm -rf "$TMP"
 fi
-git -C "$REPO_DIR" fetch --tags --force origin \
-  || echo "   (tag fetch failed now; self-update will fetch on first check)"
+git config --system --add safe.directory "$REPO_DIR" 2>/dev/null || true
 
 chown -R root:root "$REPO_DIR"        # app read-only; service runs as $TARGET_USER
 
