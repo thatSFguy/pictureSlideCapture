@@ -292,7 +292,7 @@ def _grab(stem: str) -> tuple:
     glob = f"{stem}.*"
     _wipe(glob)                                    # clear any prior file at stem
     try:
-        cam.capture(OUT_DIR / f"{stem}.%C")
+        gp_out = cam.capture(OUT_DIR / f"{stem}.%C")
     except CameraError:
         _wipe(glob)
         raise
@@ -318,9 +318,18 @@ def _grab(stem: str) -> tuple:
             derived = True
 
     if jpg is None:
+        # Nothing downloaded. Log the full gphoto2 output + dir listing to the
+        # journal (View logs) and echo a short hint in the error for /api/test.
+        listing = sorted(p.name for p in OUT_DIR.iterdir() if p.is_file())
+        detail = (gp_out or "").strip()
+        print(f"[capture] no displayable image for '{stem}'.\n"
+              f"  gphoto2 output:\n{detail or '(empty)'}\n"
+              f"  files now in {OUT_DIR}: {listing}", flush=True)
         _wipe(glob)
-        raise CameraError("captured but no displayable image — set the format "
-                          "to Large JPEG or 'RAW + L'")
+        hint = detail.replace("\n", " ")[-240:]
+        raise CameraError("captured but no displayable image (format issue, or "
+                          "the camera returned no file). gphoto2: "
+                          f"{hint or '(no output)'}")
     return jpg, raw, derived
 
 
@@ -488,8 +497,25 @@ def update_check() -> dict:
             "latest": latest, "available": available, "url": UPDATE_URL}
 
 
+_APP_MODULES = ["capture_server.py", "camera.py", "jpegstats.py", "advance.py"]
+
+
+def _app_syntax_ok() -> tuple[bool, str]:
+    """Parse the app's modules without importing/writing — catches a bad commit
+    that would otherwise crash-loop the service after an update."""
+    import ast
+    for m in _APP_MODULES:
+        p = APP_DIR / m
+        try:
+            ast.parse(p.read_text(), filename=str(p))
+        except (SyntaxError, OSError) as e:
+            return False, f"{m}: {e}"
+    return True, ""
+
+
 def update_apply() -> dict:
-    """Check out the latest release tag, then restart the service."""
+    """Check out the latest release tag, validate it, then restart. Rolls back
+    if the new code doesn't even parse, so a bad release can't brick the box."""
     info = update_check()
     latest = info["latest"]
     if not latest:
@@ -497,7 +523,14 @@ def update_apply() -> dict:
     if not info["available"]:
         return {"ok": False, "current": info["current"],
                 "error": f"already up to date ({info['current']})"}
+    prev = _git(["rev-parse", "HEAD"])               # for rollback
     _git(["checkout", "--force", latest], timeout=60)
+    ok, why = _app_syntax_ok()
+    if not ok:
+        _git(["checkout", "--force", prev], timeout=60)   # roll back, don't restart
+        print(f"[update] {latest} failed validation, rolled back: {why}", flush=True)
+        return {"ok": False, "error": f"update to {latest} aborted (won't start): "
+                f"{why}. Rolled back to {info['current']}."}
     threading.Timer(1.2, _restart_service).start()   # let this response flush
     return {"ok": True, "from": info["current"], "to": latest, "restarting": True}
 
@@ -582,8 +615,14 @@ class Handler(BaseHTTPRequestHandler):
         except (ValueError, json.JSONDecodeError):
             return {}
 
-    def _with_camera(self, fn):
-        if not cam_lock.acquire(blocking=False):
+    def _with_camera(self, fn, wait: float = 6.0):
+        # User-initiated camera ops wait briefly for the lock, so a background
+        # status poll (which holds it ~1-2s) doesn't turn a click into a
+        # spurious "camera busy". Background polls pass wait=0 to fail fast and
+        # skip silently.
+        got = (cam_lock.acquire(blocking=False) if wait <= 0
+               else cam_lock.acquire(timeout=wait))
+        if not got:
             return self._json({"ok": False, "busy": True,
                                "error": "camera busy"}, 409)
         try:
@@ -611,7 +650,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/":
             self._send(200, INDEX_HTML.encode(), "text/html; charset=utf-8")
         elif path == "/api/status":
-            self._with_camera(read_status)
+            self._with_camera(read_status, wait=0)   # poll: fail fast, skip silently
         elif path == "/api/settings":
             self._with_camera(read_settings)
         elif path == "/api/zip":

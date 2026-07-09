@@ -35,6 +35,7 @@ class Camera:
         self.retries = retries
         self.backoff = backoff
         self.verbose = verbose
+        self.last_stdout = ""     # gphoto2 output of the most recent success
 
     def _run(self, args: list[str], timeout: float = 60.0) -> str:
         """Run one gphoto2 command with retry-on-IO-error + backoff."""
@@ -51,6 +52,7 @@ class Camera:
                 last = f"timeout after {timeout}s"
             else:
                 if proc.returncode == 0:
+                    self.last_stdout = proc.stdout
                     return proc.stdout
                 last = (proc.stderr or proc.stdout).strip()
 
@@ -163,10 +165,10 @@ class Camera:
         if args:
             self._run(args)
 
-    def capture(self, dest: Path, capturetarget: str = "Memory card") -> Path:
+    def capture(self, dest: Path, capturetarget: str = "Memory card") -> str:
         """Trigger, download to `dest` (may create sibling files for RAW+JPEG),
         delete from card. `dest` may use gphoto2's %C extension token.
-        Returns the primary path written.
+        Returns the gphoto2 stdout (useful for diagnosing an empty download).
 
         capturetarget is set in the SAME gphoto2 invocation as the capture, on
         purpose: setting it in a separate command re-enumerates the 400D and
@@ -180,5 +182,4 @@ class Camera:
             args += ["--set-config-value", f"capturetarget={capturetarget}"]
         args += ["--capture-image-and-download", "--filename", str(dest),
                  "--force-overwrite"]
-        self._run(args, timeout=90.0)
-        return dest
+        return self._run(args, timeout=90.0)
