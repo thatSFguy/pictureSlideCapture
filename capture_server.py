@@ -586,6 +586,50 @@ def read_diag() -> dict:
     return d
 
 
+def debug_capture() -> dict:
+    """Try several gphoto2 capture variants and report which one actually
+    writes a file locally. Diagnostic only. Assumes cam_lock held."""
+    dst = str(OUT_DIR / "_dbg.%C")
+    variants = [
+        ("A_sdram_fname_first",
+         ["--set-config-value", "capturetarget=Internal RAM",
+          "--filename", dst, "--force-overwrite", "--capture-image-and-download"]),
+        ("B_no_target_fname_first",
+         ["--filename", dst, "--force-overwrite", "--capture-image-and-download"]),
+        ("C_no_filename_cwd",
+         ["--force-overwrite", "--capture-image-and-download"]),
+        ("D_card_keep",
+         ["--set-config-value", "capturetarget=Memory card",
+          "--filename", dst, "--force-overwrite",
+          "--capture-image-and-download", "--keep"]),
+        ("E_wait_event",
+         ["--set-config-value", "capturetarget=Internal RAM",
+          "--filename", dst, "--force-overwrite",
+          "--capture-image-and-download", "--wait-event-and-download=FILEADDED"]),
+    ]
+    results = []
+    for name, args in variants:
+        for f in list(OUT_DIR.glob("_dbg.*")):     # clean before each try
+            try: f.unlink()
+            except OSError: pass
+        before = {p.name for p in OUT_DIR.iterdir() if p.is_file()}
+        try:
+            r = subprocess.run(["gphoto2", *args], capture_output=True,
+                               text=True, cwd=str(OUT_DIR), timeout=90)
+            rc, so, se = r.returncode, r.stdout, r.stderr
+        except (OSError, subprocess.TimeoutExpired) as e:
+            rc, so, se = -1, "", str(e)
+        after = {p.name for p in OUT_DIR.iterdir() if p.is_file()}
+        new = sorted(after - before)
+        results.append({"variant": name, "rc": rc, "new_files": new,
+                        "stdout": so.strip()[-300:], "stderr": se.strip()[-300:]})
+    for f in list(OUT_DIR.glob("_dbg.*")):          # cleanup
+        try: f.unlink()
+        except OSError: pass
+    return {"ok": True, "results": results,
+            "winner": next((r["variant"] for r in results if r["new_files"]), None)}
+
+
 # ---- HTTP handler ---------------------------------------------------------
 
 class Handler(BaseHTTPRequestHandler):
@@ -693,6 +737,8 @@ class Handler(BaseHTTPRequestHandler):
             self._with_camera(do_test)
         elif path == "/api/advance":
             self._with_camera(do_advance)   # lock: never advance mid-capture
+        elif path == "/api/debugcapture":
+            self._with_camera(debug_capture, wait=15)   # diagnostic (alpha)
         elif path == "/api/update":
             self._guarded_update(check_only=False)
         elif path == "/api/settings":
