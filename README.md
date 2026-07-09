@@ -99,6 +99,8 @@ correction.
 - [x] Web capture app: presets, exposure aid, captions, review/cull, export
 - [x] Raspberry Pi appliance deploy kit (`deploy/`) — untested on hardware
 - [x] CI image build (GitHub Actions → flashable `.img` on tag/Release)
+- [ ] Speed up CI: native ARM runners instead of QEMU (~30 min → a few min);
+      gated on cost for a private repo, so revisit when public
 - [ ] Physical rig: light pad, film holder with registration, camera mount
 - [ ] First hardware shakedown of the Pi deploy (Comitup AP flow, real capture)
 - [ ] Web-based self-update: a button in the UI that pulls the latest release
