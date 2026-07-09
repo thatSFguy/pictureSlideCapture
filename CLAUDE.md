@@ -272,5 +272,14 @@ Notes / gotchas learned:
   (`git reset --hard <tag>`) and restarts the systemd service, so the appliance
   updates without SSH. `scanner` user already has NOPASSWD sudo; guard against
   updating mid-capture, only move forward, report the new version after restart.
+- LATER (pre-public hardening gate): security review of the appliance. Threat
+  model is an immutable appliance — reflash the SD card to recover. Steps:
+  remove/disable the SSH server (keep it ONLY until the first hardware bring-up
+  succeeds — it's the lifeline if the Comitup AP flow fails); scope the
+  `scanner` sudoers from NOPASSWD:ALL to a command allowlist; default-deny
+  inbound firewall (allow 8080, mDNS 5353, and :80 only in AP mode); audit
+  `capture_server.py` (path-traversal guards, subprocess arg-lists not shell,
+  prefix/name/caption sanitization); disable unused services. Note the web app
+  itself is LAN-only + behind home NAT (no WAN exposure, no auth today).
 - LATER (gantry phase): GRBL gantry, film carrier, lens/magnification, replace
   `GrblStub` with real serial control

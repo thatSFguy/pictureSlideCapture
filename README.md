@@ -102,4 +102,7 @@ correction.
 - [ ] First hardware shakedown of the Pi deploy (Comitup AP flow, real capture)
 - [ ] Web-based self-update: a button in the UI that pulls the latest release
       and restarts the service (no SSH needed on the appliance)
+- [ ] Security hardening before going public: attack-surface review of the web
+      app, remove SSH from the appliance (reflash-on-failure is the recovery
+      path), scope sudo to a command allowlist, default-deny inbound firewall
 - [ ] Automated XY gantry (GRBL) for hands-free batch scanning (`scanner.py`)
