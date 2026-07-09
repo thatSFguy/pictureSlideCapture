@@ -111,7 +111,10 @@ def _extend(v, s):
 
 
 def _luma_means(data: bytes):
-    """Decode DC of the Y component -> list of block mean brightnesses (0-255)."""
+    """Decode DC of the Y component. Returns (means, mcx, mcy, mcux, mcuy):
+    per-Y-block mean brightness (0-255) plus the MCU column/row each block
+    belongs to (for center-weighted metering), and the MCU grid size. None if
+    undecodable."""
     qt, huff_dc, huff_ac = {}, {}, {}
     comps = []          # (id, h, v, quant_id)
     scan = {}           # comp_id -> (dc_table, ac_table)
@@ -205,7 +208,7 @@ def _luma_means(data: bytes):
     else:
         chunks = [entropy]
 
-    means = []
+    means, mcx, mcy = [], [], []
     try:
         mcu_done = 0
         for chunk in chunks:
@@ -215,6 +218,7 @@ def _luma_means(data: bytes):
             pred = {c[0]: 0 for c in comps}
             count = restart if restart else total_mcu
             for _ in range(min(count, total_mcu - mcu_done)):
+                mcol, mrow = mcu_done % mcux, mcu_done // mcux
                 for (cid, h, v, qid) in comps:
                     dct, act = scan.get(cid, (0, 0))
                     for _b in range(h * v):
@@ -225,6 +229,8 @@ def _luma_means(data: bytes):
                             q0 = qt.get(qid, [1])[0] or 1
                             mean = (pred[cid] * q0) / 8.0 + 128.0
                             means.append(0.0 if mean < 0 else 255.0 if mean > 255 else mean)
+                            mcx.append(mcol)
+                            mcy.append(mrow)
                         # consume AC coefficients (values discarded)
                         k = 1
                         while k < 64:
@@ -239,8 +245,8 @@ def _luma_means(data: bytes):
                                 k += r + 1
                 mcu_done += 1
     except (KeyError, IndexError):
-        return means or None
-    return means or None
+        pass
+    return (means, mcx, mcy, mcux, mcuy) if means else None
 
 
 # ---- public API -----------------------------------------------------------
@@ -252,13 +258,20 @@ def _classify(mean, under, over):
         return "under", "Too dark — use a longer shutter."
     if mean > 210:
         return "bright", "A bit bright — try a slightly faster shutter."
-    if mean < 60:
+    if mean < 70:                        # center-weighted means run a bit higher
         return "dark", "A bit dark — try a slightly longer shutter."
     return "ok", "Looks well exposed."
 
 
-def luma_stats(path) -> dict | None:
-    """Return {'mean','under','over','status','advice'} or None if undecodable."""
+# Center-weighted metering: meter only the central fraction of the frame in
+# each dimension, so a slide's dark mount border (or any edge vignetting) does
+# not drag the reading down. Keeps central 70% -> ignores the outer 15% a side.
+CENTER_CROP = 0.70
+
+
+def luma_stats(path, crop: float = CENTER_CROP) -> dict | None:
+    """Return {'mean','under','over','status','advice'} or None if undecodable.
+    Meters the central `crop` fraction of the frame (set crop=1.0 for full-frame)."""
     try:
         with open(path, "rb") as fh:
             data = fh.read()
@@ -266,17 +279,25 @@ def luma_stats(path) -> dict | None:
         return None
     if data[:2] != b"\xff\xd8":
         return None
-    means = None
+    res = None
     try:
         thumb = _find_thumbnail(data)
         if thumb:
-            means = _luma_means(thumb)
-        if not means:                   # no thumb, or thumb undecodable
-            means = _luma_means(data)
+            res = _luma_means(thumb)
+        if not res:                     # no thumb, or thumb undecodable
+            res = _luma_means(data)
     except Exception:                   # never let the exposure aid break capture
         return None
-    if not means:
+    if not res:
         return None
+    means, mcx, mcy, mcux, mcuy = res
+    if crop and crop < 1 and mcux > 2 and mcuy > 2:
+        lox, hix = mcux * (1 - crop) / 2, mcux * (1 + crop) / 2
+        loy, hiy = mcuy * (1 - crop) / 2, mcuy * (1 + crop) / 2
+        sel = [means[i] for i in range(len(means))
+               if lox <= mcx[i] < hix and loy <= mcy[i] < hiy]
+        if len(sel) >= 16:              # enough central samples to trust
+            means = sel
     mean = sum(means) / len(means)
     under = sum(1 for x in means if x < 20) / len(means)
     over = sum(1 for x in means if x > 240) / len(means)
