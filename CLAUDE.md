@@ -249,6 +249,18 @@ bypasses the server's camera lock and both fail with I/O errors. Change settings
 through the UI/API instead.
 
 Notes / gotchas learned:
+- **Appliance boot-order / capturetarget (found on the Pi 2026-07-09):** the
+  systemd service starts at boot, *before* the camera is plugged in, so the
+  one-shot boot-time `STARTUP_SETTINGS` (which sets `capturetarget=Memory card`)
+  never applied — the 400D then defaulted to Internal RAM (sdram), which
+  captures but returns no downloadable file → the UI error "captured but no
+  displayable image". Tell-tale: `availableshots` reads an absurd number
+  (e.g. 281082). Fixed by enforcing `capturetarget` LAZILY on the first capture
+  (`ensure_capture_target()`), re-applied after any capture error (reconnect
+  resets camera config); imageformat stays user-controlled. A CF card must be
+  inserted for the Memory-card target. (Quick field fix on an old build:
+  `sudo systemctl restart slidescanner` with the camera connected, or reboot
+  with it attached, so startup re-applies the target.)
 - Camera must stay powered: it dropped off USB mid-session once (auto-power-off
   + Low battery). Disable auto-power-off; use the AC dummy-battery coupler.
 - Local browser on the dev machine uses `localhost:8080`. Reaching it from

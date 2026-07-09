@@ -282,14 +282,38 @@ def _wipe(stem_glob: str) -> None:
             pass
 
 
+_target_applied = False        # capturetarget set once per camera session
+
+
+def ensure_capture_target() -> None:
+    """Set capturetarget=Memory card once per session. Assumes lock held.
+
+    On the Pi appliance the service starts at boot, BEFORE the camera is
+    plugged in, so the boot-time STARTUP_SETTINGS never applied and the 400D
+    defaults to Internal RAM (sdram) — which captures but yields no
+    downloadable file ("captured but no displayable image"). Apply it lazily on
+    the first capture instead, and re-apply after any capture error (a
+    reconnect resets the camera's config). Only capturetarget is enforced here;
+    imageformat stays user-controlled so presets/drawer choices aren't clobbered.
+    """
+    global _target_applied
+    if _target_applied:
+        return
+    cam.configure({"capturetarget": STARTUP_SETTINGS["capturetarget"]})
+    _target_applied = True
+
+
 def _grab(stem: str) -> tuple:
     """Capture to <stem>.<ext>, normalize case, derive a preview if RAW-only.
     Returns (jpg, raw, derived) or raises CameraError. Assumes cam_lock held."""
+    global _target_applied
+    ensure_capture_target()                        # sdram default -> no file
     glob = f"{stem}.*"
     _wipe(glob)                                    # clear any prior file at stem
     try:
         cam.capture(OUT_DIR / f"{stem}.%C")
     except CameraError:
+        _target_applied = False                    # reconnect may reset config
         _wipe(glob)
         raise
 
@@ -1041,6 +1065,7 @@ def main():
             print("Detecting camera...")
             print("  " + cam.detect().splitlines()[-1])
             cam.configure(STARTUP_SETTINGS)
+            globals()["_target_applied"] = True    # capturetarget applied here
             if not cam.is_manual():
                 print("  NOTE: dial not on M — exposure settings won't apply.")
         except CameraError as e:
