@@ -268,5 +268,9 @@ Notes / gotchas learned:
   off USB mid-session on Low battery)
 - Dial in slide exposure (ISO/aperture/shutter) against the light pad
 - LATER: move web app to Raspberry Pi (deferred), LAN access, autostart
+- LATER: web-based self-update — a UI button that fetches the latest release
+  (`git reset --hard <tag>`) and restarts the systemd service, so the appliance
+  updates without SSH. `scanner` user already has NOPASSWD sudo; guard against
+  updating mid-capture, only move forward, report the new version after restart.
 - LATER (gantry phase): GRBL gantry, film carrier, lens/magnification, replace
   `GrblStub` with real serial control

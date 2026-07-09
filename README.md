@@ -100,4 +100,6 @@ correction.
 - [x] CI image build (GitHub Actions → flashable `.img` on tag/Release)
 - [ ] Physical rig: light pad, film holder with registration, camera mount
 - [ ] First hardware shakedown of the Pi deploy (Comitup AP flow, real capture)
+- [ ] Web-based self-update: a button in the UI that pulls the latest release
+      and restarts the service (no SSH needed on the appliance)
 - [ ] Automated XY gantry (GRBL) for hands-free batch scanning (`scanner.py`)
