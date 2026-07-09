@@ -1,4 +1,8 @@
-# Deploying on a Raspberry Pi Zero 2 W
+# Deploying on a Raspberry Pi Zero W / Zero 2 W
+
+> The CI image is **32-bit (armhf)** so it boots on both the single-core Zero W
+> (ARMv6) and the quad-core Zero 2 W (ARMv8). The Zero 2 W is snappier, but the
+> workload is bound by the camera's ~1.7 MB/s USB transfer, so either works.
 
 Goal — the appliance flow:
 
@@ -48,9 +52,11 @@ Two ways to produce the `slidescanner.img`:
 You need a network *for this build only*. It won't be needed on the finished
 image.
 
-1. **Flash a build card.** Raspberry Pi Imager → *Raspberry Pi OS Lite (64-bit,
-   Bookworm)*. In OS customisation set: hostname `slidescanner`, a username +
-   password, enable **SSH**, and **your WiFi** (temporary — for the build).
+1. **Flash a build card.** Raspberry Pi Imager → *Raspberry Pi OS Lite
+   (**32-bit**, Bookworm)* — 32-bit boots on every board (Zero W / Zero 2 W /
+   Pi 1+), which matches the CI image. In OS customisation set: hostname
+   `slidescanner`, a username + password, enable **SSH**, and **your WiFi**
+   (temporary — for the build).
 
 2. **Get the project onto the Pi.** The GitHub repo is private, so from your
    machine:

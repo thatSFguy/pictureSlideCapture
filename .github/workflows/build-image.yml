@@ -30,7 +30,10 @@ jobs:
         id: build
         uses: pguyot/arm-runner-action@v2
         with:
-          base_image: raspios_lite_arm64:latest
+          # 32-bit (armhf) so the image boots on ARMv6 (Pi Zero W / Pi 1) as
+          # well as the ARMv8 Zero 2 W. The workload is USB-bound, so 64-bit
+          # buys nothing here; one image covers every target board.
+          base_image: raspios_lite:latest
           image_additional_mb: 1024
           copy_repository_path: /opt/slidescanner
           commands: |
@@ -40,8 +43,10 @@ jobs:
         run: |
           IMG="${{ steps.build.outputs.image }}"
           xz -T0 -6 "$IMG"
-          echo "ASSET=${IMG}.xz" >> "$GITHUB_ENV"
-          ls -lh "${IMG}.xz"
+          NAME="slidescanner-${{ github.ref_name }}-armhf.img.xz"
+          mv "${IMG}.xz" "$NAME"
+          echo "ASSET=$NAME" >> "$GITHUB_ENV"
+          ls -lh "$NAME"
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
