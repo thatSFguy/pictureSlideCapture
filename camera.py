@@ -37,14 +37,18 @@ class Camera:
         self.verbose = verbose
         self.last_stdout = ""     # gphoto2 output of the most recent success
 
-    def _run(self, args: list[str], timeout: float = 60.0) -> str:
-        """Run one gphoto2 command with retry-on-IO-error + backoff."""
+    def _run(self, args: list[str], timeout: float = 60.0,
+             cwd: str | None = None) -> str:
+        """Run one gphoto2 command with retry-on-IO-error + backoff. `cwd` sets
+        the working directory — gphoto2 needs a WRITABLE cwd to stage a download
+        even when --filename is absolute, so captures must run from the output
+        dir, not the (root-owned) service WorkingDirectory."""
         last = ""
         for attempt in range(1, self.retries + 1):
             try:
                 proc = subprocess.run(
                     ["gphoto2", *args],
-                    capture_output=True, text=True, timeout=timeout,
+                    capture_output=True, text=True, timeout=timeout, cwd=cwd,
                 )
             except FileNotFoundError as e:
                 raise CameraError("gphoto2 not installed on this host") from e
@@ -189,4 +193,7 @@ class Camera:
         # and ~/captures stays empty). Newer gphoto2 tolerated the wrong order.
         args += ["--filename", str(dest), "--force-overwrite",
                  "--capture-image-and-download"]
-        return self._run(args, timeout=90.0)
+        # Run from the (writable) output dir — gphoto2 stages the download in
+        # cwd, so a non-writable cwd silently drops the file. This, not the
+        # arg order or capturetarget, was the real "no downloadable file" cause.
+        return self._run(args, timeout=90.0, cwd=str(dest.parent))

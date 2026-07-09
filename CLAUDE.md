@@ -44,13 +44,12 @@ workflow now, automation later.
   (capture + ~8.4MB CR2 download + delete) is **~5.6 s/frame** (~1.7 MB/s).
   Download dominates and is unavoidable per frame, but overlaps the next
   frame's gantry move+settle, so effective throughput stays near ~5 s/frame.
-- **capturetarget:** use `Internal RAM`/sdram (=0). The frame is buffered in
-  the camera and downloaded straight to the host — reliable and fast. With
-  `Memory card` (=1), `--capture-image-and-download` on this body writes the
-  frame to the CF card's DCIM folder and does NOT auto-download it — gphoto2
-  only prints "New file is in location …/IMG_xxxx.JPG on the camera" and
-  nothing lands locally. (CONFIRMED on the Pi 2026-07-09, gphoto2 2.5.28. An
-  earlier note here had this backwards — sdram is the one that works.)
+- **capturetarget:** prefer `Internal RAM`/sdram (=0) — the frame is buffered in
+  the camera and downloaded straight to the host, so it's fast and never touches
+  or wears the CF card. `Memory card` also downloads fine. (Both were verified
+  via the `/api/debugcapture` matrix once the real bug — a non-writable working
+  directory, see gotchas — was fixed. Earlier notes blaming capturetarget for
+  "no downloadable file" were wrong.)
 - **Gotchas:**
   - Camera menu: set Communication to "PC connection" (NOT "Print/PTP") or
     gphoto2 can see the camera but not control it
@@ -263,19 +262,19 @@ bypasses the server's camera lock and both fail with I/O errors. Change settings
 through the UI/API instead.
 
 Notes / gotchas learned:
-- **"captured but no displayable image" = wrong capturetarget (Pi 2026-07-09):**
-  with `capturetarget=Memory card`, `--capture-image-and-download` on the 400D
-  writes the frame to the CF card's DCIM folder but does NOT download it —
-  gphoto2 prints only "New file is in location /store…/IMG_xxxx.JPG on the
-  camera" (shutter fires, filename increments, but `~/captures` stays empty).
-  Fix: capture with **`capturetarget=Internal RAM`** (sdram) — the frame is
-  buffered in the camera and downloaded straight to the host. `camera.capture()`
-  prepends `--set-config-value capturetarget="Internal RAM"` in the SAME gphoto2
-  invocation as the capture (on a retry the set is a no-op). Diagnose via
-  **Setup → System → View logs** (the `[capture]` block echoes gphoto2's output
-  + the local dir listing) and **Camera diagnostics** (`/api/diag`).
-  NOTE: an earlier version of this note claimed Memory card was correct and
-  sdram was broken — that was BACKWARDS. sdram is the working one on this body.
+- **"captured but no displayable image" = gphoto2 needs a WRITABLE cwd (Pi
+  2026-07-09, the real root cause):** the shutter fired and gphoto2 saw the file
+  ("New file is in location … on the camera") but it never saved locally
+  (`~/captures` empty, no "Saving file as" line). Cause: **gphoto2 stages the
+  download in its current working directory even when `--filename` is absolute**,
+  and the systemd service ran with `WorkingDirectory=/opt/slidescanner` (root-
+  owned, NOT writable by the `scanner` user) → the download was silently
+  dropped. It "worked on the laptop" because that ran from a writable repo dir.
+  Fix: run gphoto2 with **`cwd=<output dir>`** — `camera.capture()` passes
+  `cwd=dest.parent`. capturetarget and `--filename` arg-order were RED HERRINGS
+  (chased both, both wrong); a `/api/debugcapture` variant matrix proved every
+  capture variant downloads fine once cwd is writable. Diagnose via
+  **Setup → System → View logs** (the `[capture]` block) + **Camera diagnostics**.
 - Camera must stay powered: it dropped off USB mid-session once (auto-power-off
   + Low battery). Disable auto-power-off; use the AC dummy-battery coupler.
 - Local browser on the dev machine uses `localhost:8080`. Reaching it from
