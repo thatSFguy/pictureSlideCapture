@@ -44,9 +44,13 @@ workflow now, automation later.
   (capture + ~8.4MB CR2 download + delete) is **~5.6 s/frame** (~1.7 MB/s).
   Download dominates and is unavoidable per frame, but overlaps the next
   frame's gantry move+settle, so effective throughput stays near ~5 s/frame.
-- **capturetarget:** use `Memory card` (=1). `Internal RAM`/sdram (=0) is
-  unreliable on this body over USB/IP — produced no downloadable file, was
-  slower, and forced a device re-enumeration.
+- **capturetarget:** use `Internal RAM`/sdram (=0). The frame is buffered in
+  the camera and downloaded straight to the host — reliable and fast. With
+  `Memory card` (=1), `--capture-image-and-download` on this body writes the
+  frame to the CF card's DCIM folder and does NOT auto-download it — gphoto2
+  only prints "New file is in location …/IMG_xxxx.JPG on the camera" and
+  nothing lands locally. (CONFIRMED on the Pi 2026-07-09, gphoto2 2.5.28. An
+  earlier note here had this backwards — sdram is the one that works.)
 - **Gotchas:**
   - Camera menu: set Communication to "PC connection" (NOT "Print/PTP") or
     gphoto2 can see the camera but not control it
@@ -259,19 +263,19 @@ bypasses the server's camera lock and both fail with I/O errors. Change settings
 through the UI/API instead.
 
 Notes / gotchas learned:
-- **capturetarget re-enumeration trap (found on the Pi 2026-07-09):** the 400D
-  defaults to Internal RAM (sdram), which captures but returns NO downloadable
-  file → the UI error "captured but no displayable image". Setting capturetarget
-  in a SEPARATE gphoto2 command does NOT help: the act of changing it
-  re-enumerates the camera, which resets it back to sdram before the next
-  (separate) capture command runs. Fix: set `capturetarget=Memory card` in the
-  SAME gphoto2 invocation as the capture — `camera.capture()` prepends
-  `--set-config-value capturetarget=…`; on a retry the set is a no-op so it
-  can't loop. A CF card must be inserted. (A lazy `ensure_capture_target()`
-  that configured it as a separate step was tried first and failed for exactly
-  this reset reason — don't reintroduce it.) Tell-tale of sdram: `availableshots`
-  reads an absurd number (e.g. 281082); check the live value via
-  **Setup → System → Camera diagnostics** (`/api/diag`).
+- **"captured but no displayable image" = wrong capturetarget (Pi 2026-07-09):**
+  with `capturetarget=Memory card`, `--capture-image-and-download` on the 400D
+  writes the frame to the CF card's DCIM folder but does NOT download it —
+  gphoto2 prints only "New file is in location /store…/IMG_xxxx.JPG on the
+  camera" (shutter fires, filename increments, but `~/captures` stays empty).
+  Fix: capture with **`capturetarget=Internal RAM`** (sdram) — the frame is
+  buffered in the camera and downloaded straight to the host. `camera.capture()`
+  prepends `--set-config-value capturetarget="Internal RAM"` in the SAME gphoto2
+  invocation as the capture (on a retry the set is a no-op). Diagnose via
+  **Setup → System → View logs** (the `[capture]` block echoes gphoto2's output
+  + the local dir listing) and **Camera diagnostics** (`/api/diag`).
+  NOTE: an earlier version of this note claimed Memory card was correct and
+  sdram was broken — that was BACKWARDS. sdram is the working one on this body.
 - Camera must stay powered: it dropped off USB mid-session once (auto-power-off
   + Low battery). Disable auto-power-off; use the AC dummy-battery coupler.
 - Local browser on the dev machine uses `localhost:8080`. Reaching it from
