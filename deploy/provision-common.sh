@@ -22,7 +22,17 @@ pc_install_comitup() {
 ap_name: slidescanner-<nnnn>
 web_service: comitup-web.service
 EOF
+  # Comitup needs NetworkManager to own wlan0; dhcpcd (if present) fights it.
+  systemctl disable dhcpcd 2>/dev/null || true
   systemctl enable NetworkManager 2>/dev/null || true
+  # The package's postinst enable is unreliable under a QEMU image build, so
+  # enable the service explicitly (matches how we enable ssh / the app).
+  systemctl enable comitup 2>/dev/null || true
+  # Bookworm soft-blocks WiFi (rfkill) until a regulatory country is set, and
+  # AP mode can't pick a channel without one — so no country == no AP. Set it
+  # (override with WIFI_COUNTRY=xx) and clear any block.
+  raspi-config nonint do_wifi_country "${WIFI_COUNTRY:-US}" 2>/dev/null || true
+  rfkill unblock wifi 2>/dev/null || true
 }
 
 pc_install_udev_rule() {
