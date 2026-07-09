@@ -273,6 +273,14 @@ Notes / gotchas learned:
   Review grid, exposure caching. Backend + endpoints verified without camera
   (seeded copies); **live click-through + real capture pending a charged
   battery** (battery died).
+- [DONE 2026-07-09] Pi Zero W appliance image builds in CI (32-bit armhf, boots
+  Zero W + Zero 2 W) and, as of v0.1.2, **raises the Comitup WiFi AP and joins
+  the network on a fresh flash** — first hardware bring-up passed. Fix vs
+  v0.1.0/0.1.1: explicitly `systemctl enable comitup` (package self-enable is
+  unreliable under the QEMU build) and set a WiFi country (Bookworm rfkill-blocks
+  the radio until one is set, so AP mode couldn't start). Still to verify on the
+  Pi: web UI reachable at `slidescanner.local:8080`, camera detect + real
+  capture over the OTG adapter.
 - [DEFERRED] Automated gantry + `scanner.py` GRBL wiring.
 
 ## Open Items / Next Steps
