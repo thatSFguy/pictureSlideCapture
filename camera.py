@@ -182,6 +182,11 @@ class Camera:
         args: list[str] = []
         if capturetarget:
             args += ["--set-config-value", f"capturetarget={capturetarget}"]
-        args += ["--capture-image-and-download", "--filename", str(dest),
-                 "--force-overwrite"]
+        # ORDER MATTERS: --filename / --force-overwrite MUST precede the capture
+        # action. gphoto2 2.5.28 (on the Pi) ignores a --filename that follows
+        # --capture-image-and-download, so the frame is captured but never saved
+        # locally (gphoto2 prints only "New file is in location … on the camera"
+        # and ~/captures stays empty). Newer gphoto2 tolerated the wrong order.
+        args += ["--filename", str(dest), "--force-overwrite",
+                 "--capture-image-and-download"]
         return self._run(args, timeout=90.0)
