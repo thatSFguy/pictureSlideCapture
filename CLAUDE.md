@@ -272,6 +272,18 @@ Notes / gotchas learned:
   (`git reset --hard <tag>`) and restarts the systemd service, so the appliance
   updates without SSH. `scanner` user already has NOPASSWD sudo; guard against
   updating mid-capture, only move forward, report the new version after restart.
+- LATER (appliance UX/security): **first-connect trust prompt** — onboarding
+  asks "Trusted home network (no login)" vs "Shared/untrusted (set an access
+  PIN)". If PIN: hash it (`hashlib`/`hmac`), signed session cookie via
+  `secrets`, gate all endpoints. Pure stdlib, re-promptable in Setup. This is
+  the clean fix for the web UI having no auth today.
+- LATER (appliance polish): serve on **port 80** instead of `:8080`. It's on
+  8080 only because Comitup's captive portal must own :80 during AP mode (phone
+  captive-portal detection hits :80). End state: fold WiFi provisioning into the
+  app (drive `nmcli`/Comitup API), drop `comitup-web`, one service on :80 for
+  both setup and scanning — also shrinks attack surface. Interim: re-add
+  `CAP_NET_BIND_SERVICE` + relocate comitup-web (loses the auto portal popup),
+  or just hide the port behind an `slidescanner.local` QR bookmark.
 - LATER (pre-public hardening gate): security review of the appliance. Threat
   model is an immutable appliance — reflash the SD card to recover. Steps:
   remove/disable the SSH server (keep it ONLY until the first hardware bring-up

@@ -105,4 +105,11 @@ correction.
 - [ ] Security hardening before going public: attack-surface review of the web
       app, remove SSH from the appliance (reflash-on-failure is the recovery
       path), scope sudo to a command allowlist, default-deny inbound firewall
+- [ ] First-connect trust prompt: choose **Trusted home network** (no login) vs
+      **Shared/untrusted** (set an access PIN → hashed, signed session cookie,
+      all stdlib) — the clean fix for the currently-open web UI
+- [ ] Serve on the default **port 80**: fold WiFi provisioning into the app
+      (`nmcli`/Comitup API) and drop `comitup-web`, so one service on one port
+      does setup + scanning (also shrinks attack surface). Until then, an
+      `slidescanner.local` QR-code bookmark hides the `:8080`.
 - [ ] Automated XY gantry (GRBL) for hands-free batch scanning (`scanner.py`)
