@@ -1414,6 +1414,7 @@ INDEX_HTML = r"""<!doctype html>
   #toast{position:fixed;left:50%;bottom:5rem;transform:translateX(-50%);background:#2a2a2a;
          color:#eee;padding:.5rem 1rem;border-radius:8px;font-size:.85rem;display:none;z-index:30}
   #toast.err{background:#5a1a1a;color:#ffb0b0} #toast.ok{background:#123a1a;color:#9fe6a8}
+  #toast.warn{background:#5a3a00;color:#ffd48a}
 </style></head>
 <body>
 <header>
@@ -1917,6 +1918,22 @@ document.addEventListener('keydown', e=>{
     else if(e.key==='ArrowRight'){ browseRecent(-1); }
   }
 });
+
+/* ---- Back-button / edge-swipe guard ----------------------------------------
+   The app is a single page — mode switches are DOM toggles, not navigation — so
+   a stray Back press (or a tablet's edge-swipe-back) would leave the app and
+   drop the operator out of a capture run. Seed a history entry and re-arm it on
+   every popstate so Back can't navigate away: it just keeps us here with a hint.
+   (Closing the tab still exits.) */
+(function guardBack(){
+  try{
+    history.pushState({ss:1}, '');
+    window.addEventListener('popstate', ()=>{
+      history.pushState({ss:1}, '');      // re-arm so the NEXT Back is caught too
+      toast('Back is off here — use the Setup / Capture / Review tabs', 'warn');
+    });
+  }catch(e){ /* History API unavailable — nothing to guard */ }
+})();
 
 setMode('setup'); status(); setInterval(status, 15000);
 setInterval(syncReview, 4000);                       // keep Review live

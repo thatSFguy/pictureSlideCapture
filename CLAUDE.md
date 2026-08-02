@@ -297,6 +297,11 @@ UI — three modes (built for high-volume, keyboard-first; see the redesign plan
   every 4s while active + on tab focus (reflects an ongoing auto-run's new
   frames and deletes from any device); paused while the lightbox is open.
 - Nav: `[` Setup, `]` Review; typing in inputs suppresses shortcuts.
+- **Back-button guard**: the SPA switches modes with DOM toggles (no history
+  navigation), so a stray browser Back — or a tablet edge-swipe-back — would
+  leave the app mid-run. `guardBack()` seeds a history entry on load and re-pushes
+  it on every `popstate`, so Back can't navigate away (it shows a hint toast and
+  stays put); closing the tab still exits.
 
 Features:
 - **Presets** (`slides`/`negatives`): ISO 100, f/8, daylight WB, format (JPEG
