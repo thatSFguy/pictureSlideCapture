@@ -164,6 +164,10 @@ No live view, so use a capture-analyze-correct loop instead:
 Files (all in repo root, stdlib only):
 - `camera.py` — shared camera control: gphoto2 CLI wrapper, one subprocess per
   op, retry-on-IO-error, get/set config, capture. Used by both tools.
+  `ready()`/`wait_ready()` probe the camera for the next shot: the 400D drops off
+  the USB bus for ~1-2s after each SDRAM capture, so before firing a rapid
+  follow-up shot (auto-reshoot, auto-exposure) we poll a cheap config read until
+  it answers again — waits exactly as long as needed instead of a blind sleep.
 - `capture_server.py` — `http.server`-based web app with an embedded
   mobile-friendly page (HTML/CSS/JS inline, no static files). Camera access is
   serialized behind a lock (camera is single-session). Endpoints:

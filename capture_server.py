@@ -30,7 +30,6 @@ import shutil
 import subprocess
 import tempfile
 import threading
-import time
 import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -46,9 +45,6 @@ from trigger import TRIGGER_DEFAULTS, TriggerError, make_trigger, read_level
 # re-enumeration reset), so startup only needs to pick the default format.
 STARTUP_SETTINGS = {"imageformat": "L"}
 EXPOSURE_KEYS = ["iso", "aperture", "shutterspeed", "whitebalance", "imageformat"]
-# Settle pause after each auto-exposure test shot, to let the 400D finish the
-# USB re-enumeration it does after an SDRAM capture before the next command.
-AUTOEXP_SETTLE_S = 1.2
 
 # Quick-start presets. ISO/aperture/WB/format are sane fixed choices; shutter is
 # only a STARTING guess — the light pad's brightness varies, so fine-tune shutter
@@ -450,7 +446,8 @@ def _auto_reshoot(stem, jpg, raw, derived, stats):
     best = {"jpg": jpg, "raw": raw, "derived": derived, "stats": stats,
             "score": _exp_score(stats)}
     try:
-        time.sleep(AUTOEXP_SETTLE_S)               # settle after the first capture
+        cam.wait_ready()                           # wait for the camera to come
+                                                   # back after the first capture
         try:
             labels, idx = _shutter_ladder()
         except CameraError as e:                   # can't read shutter -> keep original
@@ -477,7 +474,7 @@ def _auto_reshoot(stem, jpg, raw, derived, stats):
             # which would leave the frame unmetered ("exposure n/a").
             try:
                 cam.configure({"shutterspeed": labels[cur]})
-                time.sleep(AUTOEXP_SETTLE_S)
+                cam.wait_ready()                   # ensure it's ready before firing
                 tj, tr, td = _grab(f"_reshoot{k}")
             except CameraError as e:
                 print(f"[reshoot] capture failed at {labels[cur]}, keeping best: "
@@ -623,7 +620,8 @@ def auto_expose(max_steps: int = 6) -> dict:
         steps, tested, status = [], set(), None
         for _ in range(max_steps):
             jpg, _r, _d = _grab("_test")
-            time.sleep(AUTOEXP_SETTLE_S)           # let the re-enumeration finish
+            cam.wait_ready()                       # wait for the camera, not a
+                                                   # blind sleep, before the next
             stats = jpegstats.luma_stats(jpg) or {}
             status = stats.get("status")
             steps.append({"shutter": labels[idx], "mean": stats.get("mean"),

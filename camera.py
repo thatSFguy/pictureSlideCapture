@@ -150,6 +150,37 @@ class Camera:
     def available_shots(self) -> str:
         return self.get_config("availableshots")
 
+    def ready(self) -> bool:
+        """One quick probe: True if the camera answers a config read right now.
+        Single attempt, no retry/backoff (the caller polls) — a cheap read that
+        needs no writable cwd and doesn't touch the shutter."""
+        try:
+            proc = subprocess.run(
+                ["gphoto2", "--get-config", "availableshots"],
+                capture_output=True, text=True, timeout=15)
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+        return proc.returncode == 0
+
+    def wait_ready(self, timeout: float = 8.0, poll: float = 0.4,
+                   settle: float = 0.5) -> bool:
+        """Wait until the camera is ready for the next command, or `timeout`.
+
+        The 400D drops off the USB bus for ~1-2s after each SDRAM capture (it
+        re-enumerates), during which PTP ops fail. Polling `ready()` waits
+        exactly as long as needed — better than a blind sleep — and returns True
+        once it answers again (False on timeout). `settle` is a short initial
+        pause so we don't catch the brief still-alive window *before* the drop."""
+        if settle:
+            time.sleep(settle)
+        end = time.monotonic() + timeout
+        while True:
+            if self.ready():
+                return True
+            if time.monotonic() >= end:
+                return False
+            time.sleep(poll)
+
     def is_manual(self) -> bool:
         return self.mode().lower() == "manual"
 
