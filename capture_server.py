@@ -513,7 +513,10 @@ def _auto_reshoot(stem, jpg, raw, derived, stats):
     winner is promoted onto `stem`, so an overshoot never leaves it worse.
     Returns (jpg, raw, derived, stats, tries). Assumes cam_lock held."""
     prev = (cam.retries, cam.backoff)
-    cam.retries, cam.backoff = max(cam.retries, 6), max(cam.backoff, 1.2)
+    cam.retries, cam.backoff = 2, 0.5          # best-effort: fail FAST so a
+                                               # flagged frame can't burn ~18s
+                                               # retrying a reshoot the 400D keeps
+                                               # refusing ("could not claim")
     tries = []
     best = {"jpg": jpg, "raw": raw, "derived": derived, "stats": stats,
             "score": _exp_score(stats)}
@@ -608,6 +611,11 @@ def do_capture() -> dict:
     """Capture one frame into the current group. Assumes cam_lock held."""
     prefix, n = PREFIX, next_index(PREFIX)
     stem = f"{prefix}_{n:04d}"
+    # Fire only once the camera is back on the bus. The 400D re-enumerates after
+    # every SDRAM capture, so firing blind right after the previous slide often
+    # downloads nothing and forces a slow wait-then-refire recovery (~18s). A
+    # quick readiness probe first (no settle) makes the first shot succeed.
+    cam.wait_ready(settle=0)
     jpg, raw, derived = _grab(stem)
     stats = jpegstats.luma_stats(jpg)
     reshoots = []
