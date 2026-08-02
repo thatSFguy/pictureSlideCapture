@@ -17,10 +17,16 @@ import time
 from pathlib import Path
 
 
-# Substrings that indicate the transient USB re-enumeration / claim error
-# (seen under WSL USB/IP; harmless on a Pi but retried anyway).
+# Substrings that indicate a transient USB re-enumeration / claim / device-busy
+# error worth retrying. The 400D drops off and re-enumerates after every SDRAM
+# capture, so a command fired in that window (a reshoot, an auto-expose step, a
+# rapid sensor shot) comes back with one of these. "busy" / PTP 0x2019 were the
+# gap: gphoto2 reports the re-enumeration as "PTP Device Busy" (device-busy),
+# which the old list missed, so those ops failed instead of retrying. The camera
+# is single-session behind our lock, so "busy" is always transient here.
 _RETRYABLE = ("i/o problem", "-7", "could not find the requested device",
-              "could not claim", "no camera found", "-53", "-52")
+              "could not claim", "no camera found", "-53", "-52",
+              "busy", "0x2019", "-110", "-16")
 
 
 class CameraError(RuntimeError):

@@ -161,6 +161,10 @@ def sensor_capture() -> None:
         print(f"[trigger] camera busy ({lock_status()}) — SKIPPED this slide",
               flush=True)
         return
+    # Hands-off batch: be patient so a shot fired while the 400D is still
+    # re-enumerating rides it out instead of failing (the UI stays fail-fast).
+    prev = (cam.retries, cam.backoff)
+    cam.retries, cam.backoff = max(cam.retries, 6), max(cam.backoff, 1.0)
     try:
         res = do_capture()
         status = (res.get("exposure") or {}).get("status", "?")
@@ -172,6 +176,7 @@ def sensor_capture() -> None:
         print(f"[trigger] capture FAILED after {time.monotonic() - t0:.1f}s: "
               f"{friendly(str(e))}", flush=True)
     finally:
+        cam.retries, cam.backoff = prev
         _lock_release()
 
 

@@ -26,24 +26,28 @@ there's no pip dependency (`apt install gpiod`). Command syntax differs between
 libgpiod v1 and v2 (recent Raspberry Pi OS ships v2), so the argv is built by
 `gpiocli`, which auto-detects the version.
 
-Two daemon threads cooperate so a slide dropped *while the previous capture is
-still running* isn't lost (captures take many seconds on the Pi):
+Two daemon threads cooperate:
 
   - a **reader** thread streams edges from one long-lived `gpiomon` in real time
     (never blocked by a capture) and, for each debounced edge, sets a single
     "capture requested" flag;
-  - a **worker** thread performs captures one at a time. An edge that arrives
-    during a capture leaves the flag set, so the worker fires again the moment
-    it's free instead of the edge being discarded. The flag is coalesced, so a
-    burst of edges (contact bounce, or the camera's own USB re-enumeration noise
-    during a capture) collapses to at most one pending capture.
+  - a **worker** thread performs captures one at a time.
 
-To avoid re-firing on that re-enumeration noise, a *queued* capture (one
-requested while a capture was already running) is taken only if the beam still
-reads obstructed — i.e. a slide is actually seated (`verify`). The first,
-immediate edge is trusted, so the single-slide path behaves as before. The
-capture callback is serialized by the server behind the same camera lock as the
-web UI, so a sensor trigger and a button press can never overlap.
+The 400D emits a **phantom obstruct edge the instant each capture finishes** —
+its USB re-enumeration couples a transient onto the sensor line (confirmed in the
+logs: an edge at the exact second every shot completes, which a hands-off
+operator can't produce, having no completion signal to react to). So after each
+shot the worker settles briefly and then **discards anything the reader queued
+during the shot**, swallowing that transient instead of firing a phantom frame.
+The trade-off is that a slide dropped *during* a capture isn't queued — but on
+this camera a shot takes ~18s and the operator can't feed faster than that
+anyway, so real drops land in the gap and fire normally.
+
+(An earlier version tried to keep queued drops by level-checking the beam with
+`gpioget`, but the reader's `gpiomon` holds the line, so every check failed
+"sensor read failed" and dropped the slide — hence this simpler, reliable
+model.) The capture callback is serialized by the server behind the same camera
+lock as the web UI, so a sensor trigger and a button press can never overlap.
 
 Nothing here runs unless `mode` is "gpio" in settings, so importing/using this
 module with the default config is a safe no-op (and needs no GPIO hardware).
@@ -68,23 +72,22 @@ TRIGGER_DEFAULTS = {
     "bias": "pull-up",        # internal bias: pull-up|pull-down|disable|as-is
                               # (pull-up gives an open-collector sensor a defined
                               #  idle HIGH; use as-is for a push-pull output)
-    "cooldown_s": 1.5,        # contact-bounce debounce on the reader (capped low
-                              #  internally — see _BOUNCE_MAX). No longer gates
-                              #  real slides: the queue+verify model below keeps a
-                              #  slide dropped mid-capture from being lost.
-    "verify": True,           # before taking a capture that was QUEUED during a
-                              #  previous one, confirm the beam still reads
-                              #  obstructed (a slide is seated). Rejects the
-                              #  camera's USB re-enumeration noise edge without
-                              #  dropping real slides. Off -> take queued shots
-                              #  unconditionally (may double-fire on noise).
+    "cooldown_s": 2.0,        # post-capture settle: after a shot fires, wait this
+                              #  long, then discard any edge that queued during the
+                              #  shot. Swallows the camera's USB re-enumeration
+                              #  transient — a phantom obstruct edge that lands on
+                              #  the sensor line the instant each capture finishes
+                              #  (confirmed in the logs). See SensorTrigger._serve.
 }
 
-# Reader-side contact-bounce debounce ceiling (seconds). The reader coalesces
-# edges into a single pending request, so a *long* debounce here would drop a
-# genuine next-slide edge that lands soon after the previous one; real electrical
-# bounce is sub-millisecond, so a few hundred ms is plenty.
-_BOUNCE_MAX = 0.5
+# Reader-side contact-bounce debounce (seconds): collapse the several edges of a
+# single physical slide drop into one trigger. Kept short — a genuine next slide
+# is seconds away, never sub-second.
+_READER_BOUNCE = 0.3
+
+# Floor for the post-capture settle regardless of a stale persisted cooldown_s,
+# so the re-enumeration transient (~1-2s) is reliably covered.
+_SETTLE_MIN = 2.0
 
 
 class TriggerError(Exception):
@@ -143,16 +146,16 @@ class SensorTrigger:
         self.chip = str(_cfg(settings, "gpiochip"))
         try:
             self.line = int(_cfg(settings, "sensor_line"))
-            self.cooldown = max(0.0, float(_cfg(settings, "cooldown_s")))
+            cooldown = max(0.0, float(_cfg(settings, "cooldown_s")))
         except (TypeError, ValueError) as e:
             raise TriggerError(f"bad trigger config: {e}")
         self.active_high = bool(_cfg(settings, "active_high"))
-        self.verify = bool(_cfg(settings, "verify"))
         # unobstructed -> obstructed is a rising edge if obstructed reads HIGH,
         # else a falling edge.
         self.edge = "rising" if self.active_high else "falling"
         self.bias = str(_cfg(settings, "bias"))
-        self._bounce = min(self.cooldown, _BOUNCE_MAX)
+        self._bounce = _READER_BOUNCE
+        self._settle = max(cooldown, _SETTLE_MIN)   # post-capture quiet window
         self._stop = threading.Event()
         self._req = threading.Event()      # a capture is requested (coalesced)
         self._reader: threading.Thread | None = None
@@ -247,45 +250,20 @@ class SensorTrigger:
             self._req.clear()
             self._log("[trigger] edge detected -> capturing")
             self._fire()
-            # A slide dropped WHILE that capture ran left _req set. Fire again —
-            # but only if the beam still reads obstructed, so a transient (the
-            # camera's re-enumeration noise, or a slide already pulled back out)
-            # doesn't shoot an empty frame.
-            while self._req.is_set() and not self._stop.is_set():
-                self._req.clear()
-                seated = self._seated()
-                if seated is False:
-                    self._log("[trigger] queued edge but beam now clear — skipping")
-                    break
-                if seated is None:
-                    self._log("[trigger] queued edge; sensor read failed — skipping")
-                    break
-                self._log("[trigger] queued slide still seated -> capturing")
-                self._fire()
+            # Post-capture settle: the 400D's USB re-enumeration fires a phantom
+            # obstruct edge on the sensor line right as the shot completes. Wait
+            # for it to pass, then drop whatever queued during the shot (that
+            # transient, plus any slide staged mid-capture we can't shoot anyway)
+            # so it can't trigger a phantom frame. A genuinely new slide dropped
+            # after this window sets _req again and fires on the next loop.
+            self._stop.wait(self._settle)
+            self._req.clear()
 
     def _fire(self) -> None:
         try:
             self._on_trigger()
         except Exception as e:                         # never kill the worker
             self._log(f"[trigger] capture callback error: {e}")
-
-    def _seated(self):
-        """For a QUEUED capture: True if the beam currently reads obstructed
-        (a slide is seated), False if clear, None if the level couldn't be read.
-        Always True when `verify` is off (take queued shots unconditionally)."""
-        if not self.verify:
-            return True
-        args = gpiocli.with_sudo(gpiocli.get_cmd(self.chip, self.line, self.bias),
-                                 self.chip, self.line, self.bias)
-        try:
-            r = subprocess.run(args, capture_output=True, text=True, timeout=5)
-            if r.returncode != 0:
-                return None
-            lvl = gpiocli.parse_level(r.stdout)
-        except (OSError, subprocess.TimeoutExpired, ValueError):
-            return None
-        obstructed = 1 if self.active_high else 0
-        return lvl == obstructed
 
     @staticmethod
     def _line_buffered(args: list[str]) -> list[str]:

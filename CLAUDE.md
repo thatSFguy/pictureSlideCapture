@@ -238,22 +238,25 @@ Files (all in repo root, stdlib only):
   a **reader** streams edges from one long-lived `gpiomon` in real time and, for
   each debounced edge, sets a single coalesced "capture requested" flag; a
   **worker** performs captures one at a time on the **unobstructed→obstructed**
-  edge. This split is the fix for *"the sensor sometimes doesn't fire"*: a slide
-  dropped **while the previous ~18s capture is still running** used to be
-  buffered then discarded by the post-capture cooldown; now it leaves the flag
-  set and the worker fires again the moment it's free (edges are no longer lost
-  to a busy capture). **Polarity is configurable** because sensor OUT idle state
+  edge. **Key hardware quirk (fixed here):** the 400D's USB re-enumeration fires
+  a **phantom obstruct edge on the sensor line the instant each capture
+  finishes** (confirmed in the logs — an edge at the exact second every ~18s shot
+  completes, which a hands-off operator can't produce). So after each shot the
+  worker **settles (`cooldown_s`, floored at `_SETTLE_MIN`=2s) then discards
+  anything the reader queued during the shot**, swallowing that transient instead
+  of firing a phantom frame; a genuinely new slide dropped after the window fires
+  normally. (An earlier attempt kept mid-capture drops by level-checking the beam
+  with `gpioget`, but the reader's own `gpiomon` holds the line, so every check
+  failed *"sensor read failed"* and dropped the slide — that regression is
+  removed.) The operator can't feed faster than ~18s/shot anyway, so real drops
+  land in the gap. **Polarity is configurable** because sensor OUT idle state
   varies: `active_high=False` (default) treats obstructed as LOW → **falling**
   edge; `active_high=True` → **rising** edge. `bias` sets an internal pull-up
   (default, gives an open-collector sensor a defined idle) / pull-down / disable.
-  `cooldown_s` is now only a short reader-side contact-bounce debounce (capped at
-  `_BOUNCE_MAX`=0.5s so it can't drop a real next-slide edge). A capture that was
-  **queued** during a previous one is taken only if `verify` (default on) reads
-  the beam still obstructed via `gpioget` — so the 400D's USB re-enumeration
-  noise edge (the one discarded after every capture in the old logs) doesn't
-  shoot an empty frame, while a genuinely seated slide still fires. Set
-  `verify=false` to take queued shots unconditionally. `read_level()` (`gpioget`)
-  reads the raw 0/1 so polarity can be discovered by blocking the beam. The
+  The reader coalesces contact bounce with a short fixed debounce
+  (`_READER_BOUNCE`=0.3s). `read_level()` (`gpioget`, used only from the UI when
+  the watcher isn't holding the line) reads the raw 0/1 so polarity can be
+  discovered by blocking the beam. The
   trigger callback (`sensor_capture`) is serialized behind the same `cam_lock`,
   so a sensor shot and a button press never overlap; if the camera is busy the
   trigger is skipped, not queued.
