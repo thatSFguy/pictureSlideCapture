@@ -100,6 +100,15 @@ advance → beam blocked → capture → repeat.
 
 ### Wiring — Raspberry Pi 40-pin header
 
+The board's header usually isn't silk-screened with pin numbers. **Pin 1 is the
+square solder pad** (nearest the corner); pins count in pairs down the header —
+odd numbers in one row, even in the other.
+
+<p align="center">
+  <img src="docs/pinout-rpi.svg" width="480"
+       alt="Raspberry Pi 40-pin header pinout; pin 1 (3V3) = VCC, pin 6 = GND, pin 18 (GPIO24) = OUT">
+</p>
+
 | Sensor wire | Connect to | Physical pin |
 |-------------|------------|--------------|
 | **VCC** | **3V3** | **1** |
