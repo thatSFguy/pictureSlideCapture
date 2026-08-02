@@ -1497,10 +1497,25 @@ async function showLogs(){
 /* ---- review ---- */
 function eclass(st){ if(!st) return 'e-none'; if(st==='ok') return 'e-ok';
   if(st==='under'||st==='over') return 'e-bad'; return 'e-warn'; }
+function revSig(items){ return (items||[]).map(i=>i.name+':'+(i.caption||'')+':'+(i.exposure||'')).join('|'); }
 async function loadReview(reset){
   if(reset){ rev.items=[]; rev.offset=0; }
   const d=await jget('/api/images?offset='+rev.offset+'&limit='+rev.limit);
   rev.total=d.total; rev.items=rev.items.concat(d.items); rev.offset=rev.items.length;
+  rev._sig=revSig(rev.items);
+  renderGrid();
+}
+// Keep Review live without a manual refresh: while it's the active view, re-poll
+// the group and re-render only when the set actually changed (adds from an
+// ongoing auto-run, deletes from here or another device). Paused while the
+// lightbox is open so it never disrupts an in-progress caption/delete.
+async function syncReview(){
+  if(mode!=='review' || document.hidden) return;
+  if($('#lb').classList.contains('open')) return;
+  const want=Math.min(200, Math.max(rev.limit, rev.items.length));
+  let d; try{ d=await jget('/api/images?offset=0&limit='+want); }catch(e){ return; }
+  if(d.total===rev.total && revSig(d.items)===rev._sig) return;   // nothing changed
+  rev.items=d.items; rev.total=d.total; rev.offset=rev.items.length; rev._sig=revSig(rev.items);
   renderGrid();
 }
 function visibleItems(){ return $('#flagOnly').checked ? rev.items.filter(i=>FLAG[i.exposure]) : rev.items; }
@@ -1571,6 +1586,9 @@ document.addEventListener('keydown', e=>{
 });
 
 setMode('setup'); status(); setInterval(status, 15000);
+setInterval(syncReview, 4000);                       // keep Review live
+window.addEventListener('focus', syncReview);
+document.addEventListener('visibilitychange', ()=>{ if(!document.hidden) syncReview(); });
 </script>
 </body></html>
 """
