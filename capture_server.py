@@ -360,11 +360,16 @@ def _wipe(stem_glob: str) -> None:
             pass
 
 
-def _grab(stem: str) -> tuple:
+def _grab(stem: str, _retry: bool = True) -> tuple:
     """Capture to <stem>.<ext>, normalize case, derive a preview if RAW-only.
     Returns (jpg, raw, derived) or raises CameraError. Assumes cam_lock held.
     capturetarget=Memory card is set inside cam.capture() (same gphoto2 session)
-    so the 400D can't re-enumerate back to Internal RAM between set and shot."""
+    so the 400D can't re-enumerate back to Internal RAM between set and shot.
+
+    If nothing downloads (often because a shot fired while the 400D was still
+    re-enumerating from the previous capture — e.g. a sensor trigger landing
+    before the camera came back), wait for the camera and re-fire once. This
+    costs nothing on a normal shot; it only kicks in on the tight-margin miss."""
     glob = f"{stem}.*"
     _wipe(glob)                                    # clear any prior file at stem
     try:
@@ -394,14 +399,21 @@ def _grab(stem: str) -> tuple:
             derived = True
 
     if jpg is None:
-        # Nothing downloaded. Log the full gphoto2 output + dir listing to the
-        # journal (View logs) and echo a short hint in the error for /api/test.
+        _wipe(glob)
+        # Nothing downloaded. Most often the camera was still re-enumerating from
+        # the previous shot: wait for it to answer, then re-fire once.
+        if _retry:
+            print(f"[capture] no file for '{stem}' — waiting for the camera and "
+                  "re-firing once", flush=True)
+            cam.wait_ready()
+            return _grab(stem, _retry=False)
+        # Still nothing after a retry. Log the full gphoto2 output + dir listing
+        # to the journal (View logs) and echo a short hint in the error.
         listing = sorted(p.name for p in OUT_DIR.iterdir() if p.is_file())
         detail = (gp_out or "").strip()
-        print(f"[capture] no displayable image for '{stem}'.\n"
+        print(f"[capture] no displayable image for '{stem}' (after retry).\n"
               f"  gphoto2 output:\n{detail or '(empty)'}\n"
               f"  files now in {OUT_DIR}: {listing}", flush=True)
-        _wipe(glob)
         hint = detail.replace("\n", " ")[-240:]
         raise CameraError("captured but no displayable image (format issue, or "
                           "the camera returned no file). gphoto2: "
