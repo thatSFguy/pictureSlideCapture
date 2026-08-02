@@ -135,7 +135,17 @@ cooldown debounces bounce and avoids a double-fire during the download.
 CLI equivalents: `--sensor`, `--sensor-line N` (BCM, default 24),
 `--sensor-active-high`. Needs `gpiod` (`sudo apt install gpiod`; already in the
 appliance image). Sensor captures share the camera lock with the UI, so a sensor
-shot and a button press never overlap.
+shot and a button press never overlap. libgpiod **v1 and v2** are both supported
+(the CLI syntax differs between them; the app auto-detects the version).
+
+To sanity-check wiring by hand from a shell (libgpiod **v2**, recent Pi OS):
+
+```bash
+gpioget -c gpiochip0 24               # prints 24=inactive / 24=active
+gpiomon -c gpiochip0 -e falling 24    # block/clear the beam → an event per edge
+```
+
+On older **v1** it's `gpioget gpiochip0 24` / `gpiomon --falling-edge gpiochip0 24`.
 
 ## Files
 

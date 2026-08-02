@@ -210,10 +210,18 @@ Files (all in repo root, stdlib only):
   calls it after each capture when enabled (`after_capture`); a failed advance
   is reported in the response, never fatal (image is already saved). Motor path
   is written but UNTESTED on hardware — first run is a bring-up.
+- `gpiocli.py` — version-aware libgpiod CLI argv builders (`get_cmd`/`mon_cmd`/
+  `set_hold_cmd`/`parse_level`). **libgpiod v1 and v2 have incompatible syntax**
+  (v2, on recent Pi OS: `gpioget -c <chip> <line>`, `gpiomon -e rising -c …`; v1:
+  `gpioget <chip> <line>`, `gpiomon --rising-edge …`). A hard-coded v1 command
+  fails on v2 with `cannot find line 'gpiochip0'` (v2 parses the chip as a line
+  name). `major()` detects the version once; `trigger.py` + `advance.py` use it
+  so both work on either. Reads parse v1 (`0`/`1`) and v2 (`24=inactive`).
 - `trigger.py` — optical-sensor capture trigger (settings-driven, default
   `off`). A background daemon thread reads one long-lived `gpiomon` (libgpiod
-  via subprocess, same pattern as advance.py — needs `apt install gpiod`, now in
-  the appliance image) and fires a capture on the **unobstructed→obstructed**
+  via subprocess through `gpiocli`, same pattern as advance.py — needs `apt
+  install gpiod`, now in the appliance image) and fires a capture on the
+  **unobstructed→obstructed**
   edge. **Polarity is configurable** because sensor OUT idle state varies:
   `active_high=False` (default) treats obstructed as LOW → **falling** edge;
   `active_high=True` → **rising** edge. `bias` sets an internal pull-up (default,

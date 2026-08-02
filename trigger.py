@@ -22,7 +22,9 @@ line reads 0 or 1 when obstructed, then set `active_high` to match.
 
 Like advance.py, GPIO is driven by shelling out to libgpiod (`gpiomon` /
 `gpioget`) — the same subprocess-to-CLI pattern the project uses for gphoto2, so
-there's no pip dependency (`apt install gpiod`). The watcher runs in a daemon
+there's no pip dependency (`apt install gpiod`). Command syntax differs between
+libgpiod v1 and v2 (recent Raspberry Pi OS ships v2), so the argv is built by
+`gpiocli`, which auto-detects the version. The watcher runs in a daemon
 thread reading one long-lived `gpiomon` (so no edges are missed between polls);
 each detected edge calls the capture callback, which the server serializes
 behind the same camera lock as the web UI, so a sensor trigger and a button
@@ -38,6 +40,8 @@ import shutil
 import subprocess
 import threading
 import time
+
+import gpiocli
 
 # ---- settings schema (all keys optional; missing ones fall back here) ------
 TRIGGER_DEFAULTS = {
@@ -64,11 +68,6 @@ def _cfg(s: dict, k: str):
     return s.get(k, TRIGGER_DEFAULTS[k])
 
 
-def _bias_args(bias) -> list[str]:
-    b = str(bias).lower()
-    return ["--bias", b] if b in ("pull-up", "pull-down", "disable") else []
-
-
 def read_level(settings: dict) -> int:
     """Read the sensor's current raw level (0 or 1) with `gpioget`.
 
@@ -80,20 +79,19 @@ def read_level(settings: dict) -> int:
         raise TriggerError("gpioget not found — run `sudo apt install gpiod`")
     chip = str(_cfg(settings, "gpiochip"))
     try:
-        line = str(int(_cfg(settings, "sensor_line")))
+        line = int(_cfg(settings, "sensor_line"))
     except (TypeError, ValueError) as e:
         raise TriggerError(f"bad sensor_line: {e}")
-    args = ["gpioget", *_bias_args(_cfg(settings, "bias")), chip, line]
+    args = gpiocli.get_cmd(chip, line, _cfg(settings, "bias"))
     try:
         r = subprocess.run(args, capture_output=True, text=True, timeout=5)
     except (OSError, subprocess.TimeoutExpired) as e:
         raise TriggerError(str(e))
     if r.returncode != 0:
         raise TriggerError((r.stderr or r.stdout or "gpioget failed").strip())
-    tok = (r.stdout or "").split()
     try:
-        return int(tok[-1])
-    except (IndexError, ValueError):
+        return gpiocli.parse_level(r.stdout)
+    except ValueError:
         raise TriggerError(f"unexpected gpioget output: {r.stdout!r}")
 
 
@@ -115,7 +113,7 @@ class SensorTrigger:
         self.active_high = bool(_cfg(settings, "active_high"))
         # unobstructed -> obstructed is a rising edge if obstructed reads HIGH,
         # else a falling edge.
-        self.edge = "--rising-edge" if self.active_high else "--falling-edge"
+        self.edge = "rising" if self.active_high else "falling"
         self.bias = str(_cfg(settings, "bias"))
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -144,8 +142,7 @@ class SensorTrigger:
         self._log(f"[trigger] watching {self.describe()}")
 
     def _run(self) -> None:
-        args = ["gpiomon", self.edge, *_bias_args(self.bias),
-                self.chip, str(self.line)]
+        args = gpiocli.mon_cmd(self.chip, self.line, self.edge, self.bias)
         fails = 0
         while not self._stop.is_set():
             try:

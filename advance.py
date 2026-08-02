@@ -31,6 +31,8 @@ import shutil
 import subprocess
 import time
 
+import gpiocli
+
 # ---- settings schema (all keys optional; missing ones fall back here) ------
 ADVANCE_DEFAULTS = {
     "mode": "off",            # "off" | "motor" | "stepper"
@@ -100,10 +102,9 @@ class MotorAdvancer(Advancer):
             self.chip = str(_cfg(s, "gpiochip"))
             self.motor_line = int(_cfg(s, "motor_line"))
             self.motor_on = "1" if _cfg(s, "motor_active_high") else "0"
-            self.motor_off = "0" if _cfg(s, "motor_active_high") else "1"
             self.switch_line = int(_cfg(s, "switch_line"))
-            self.switch_edge = "--falling-edge" if _cfg(s, "switch_falling") \
-                else "--rising-edge"
+            self.switch_edge = "falling" if _cfg(s, "switch_falling") \
+                else "rising"
             self.timeout_s = float(_cfg(s, "timeout_s"))
             self.settle_ms = int(_cfg(s, "settle_ms"))
         except (TypeError, ValueError) as e:
@@ -117,23 +118,17 @@ class MotorAdvancer(Advancer):
             if shutil.which(tool) is None:
                 raise AdvanceError(f"{tool} not found — `apt install gpiod`")
 
-    def _set_motor(self, value: str) -> None:
-        # gpioset holds the line only while it runs; for a momentary drive we
-        # start it, wait for the switch, then kill it. Here we use the
-        # fire-and-return form to set a steady level via a backgrounded hold.
-        subprocess.run(["gpioset", self.chip, f"{self.motor_line}={value}"],
-                       check=True, timeout=5)
-
     def advance(self) -> None:
         self._require_tools()
-        # Energize, wait for the switch edge (bounded by timeout), de-energize.
+        # Energize (hold the line), wait for the switch edge bounded by timeout,
+        # then release the line to de-energize. gpiocli builds the right argv for
+        # the installed libgpiod (v1 vs v2).
         hold = subprocess.Popen(
-            ["gpioset", "--mode=signal", self.chip,
-             f"{self.motor_line}={self.motor_on}"])
+            gpiocli.set_hold_cmd(self.chip, self.motor_line, self.motor_on))
         try:
             r = subprocess.run(
-                ["gpiomon", "--num-events=1", self.switch_edge,
-                 self.chip, str(self.switch_line)],
+                gpiocli.mon_cmd(self.chip, self.switch_line, self.switch_edge,
+                                num_events=1),
                 timeout=self.timeout_s)
             if r.returncode != 0:
                 raise AdvanceError("switch never tripped (motor/switch wiring?)")
@@ -142,12 +137,11 @@ class MotorAdvancer(Advancer):
                 f"advance timed out after {self.timeout_s:.1f}s — jam or "
                 "missed index switch")
         finally:
-            hold.terminate()
+            hold.terminate()                 # release motor line -> de-energize
             try:
                 hold.wait(timeout=2)
             except subprocess.TimeoutExpired:
                 hold.kill()
-            self._set_motor(self.motor_off)  # ensure de-energized
         if self.settle_ms:
             time.sleep(self.settle_ms / 1000.0)
 
