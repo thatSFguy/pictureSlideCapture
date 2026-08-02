@@ -30,6 +30,7 @@ import shutil
 import subprocess
 import tempfile
 import threading
+import time
 import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -45,6 +46,9 @@ from trigger import TRIGGER_DEFAULTS, TriggerError, make_trigger, read_level
 # re-enumeration reset), so startup only needs to pick the default format.
 STARTUP_SETTINGS = {"imageformat": "L"}
 EXPOSURE_KEYS = ["iso", "aperture", "shutterspeed", "whitebalance", "imageformat"]
+# Settle pause after each auto-exposure test shot, to let the 400D finish the
+# USB re-enumeration it does after an SDRAM capture before the next command.
+AUTOEXP_SETTLE_S = 1.2
 
 # Quick-start presets. ISO/aperture/WB/format are sane fixed choices; shutter is
 # only a STARTING guess — the light pad's brightness varies, so fine-tune shutter
@@ -445,44 +449,58 @@ def auto_expose(max_steps: int = 6) -> dict:
     the camera on the chosen shutter. Assumes cam_lock held.
 
     Note: the exposure aid meters the whole frame, so a wide black slide-mount
-    border biases it dark — tighten framing for best results."""
-    full = cam.get_config_full(["shutterspeed"]).get("shutterspeed", {})
-    ladder = sorted(((sec, c) for c in full.get("choices", [])
-                     if (sec := _shutter_seconds(c)) is not None),
-                    key=lambda x: x[0])
-    labels = [c for _, c in ladder]
-    if len(labels) < 2:
-        return {"ok": False, "error": "shutter isn't adjustable — is the mode "
-                "dial on M?"}
-    current = full.get("current", "")
-    if current in labels:
-        idx = labels.index(current)
-    else:                                          # start from the nearest speed
-        cs = _shutter_seconds(current) or ladder[0][0]
-        idx = min(range(len(ladder)), key=lambda i: abs(ladder[i][0] - cs))
-    steps, tested, status = [], set(), None
-    for _ in range(max_steps):
-        jpg, _r, _d = _grab("_test")
-        stats = jpegstats.luma_stats(jpg) or {}
-        status = stats.get("status")
-        steps.append({"shutter": labels[idx], "mean": stats.get("mean"),
-                      "status": status})
-        tested.add(idx)
-        if status == "ok" or status is None:
-            break
-        if status in ("dark", "under"):
-            nxt = idx + 1                          # longer exposure -> brighter
-        elif status in ("over", "bright"):
-            nxt = idx - 1                          # shorter -> darker
-        else:
-            break
-        if not (0 <= nxt < len(labels)) or nxt in tested:
-            break                                  # at an edge, or oscillating
-        idx = nxt
-        cam.configure({"shutterspeed": labels[idx]})
-    return {"ok": True, "final_shutter": labels[idx], "status": status,
-            "steps": steps, "name": "_test.jpg",
-            "exposure": jpegstats.luma_stats(OUT_DIR / "_test.jpg")}
+    border biases it dark — tighten framing for best results.
+
+    The 400D re-enumerates on the USB bus after each SDRAM capture, so the very
+    next gphoto2 command (here: changing the shutter) can land mid-reset and
+    fail with a transient claim/IO error. A single capture never sees this (no
+    command follows immediately), but this back-to-back loop does — so we settle
+    briefly after each shot and make the camera extra patient for the duration
+    (safe: cam_lock is held, so nothing else touches the camera)."""
+    prev_retries, prev_backoff = cam.retries, cam.backoff
+    cam.retries = max(cam.retries, 6)
+    cam.backoff = max(cam.backoff, 1.2)
+    try:
+        full = cam.get_config_full(["shutterspeed"]).get("shutterspeed", {})
+        ladder = sorted(((sec, c) for c in full.get("choices", [])
+                         if (sec := _shutter_seconds(c)) is not None),
+                        key=lambda x: x[0])
+        labels = [c for _, c in ladder]
+        if len(labels) < 2:
+            return {"ok": False, "error": "shutter isn't adjustable — is the "
+                    "mode dial on M?"}
+        current = full.get("current", "")
+        if current in labels:
+            idx = labels.index(current)
+        else:                                      # start from the nearest speed
+            cs = _shutter_seconds(current) or ladder[0][0]
+            idx = min(range(len(ladder)), key=lambda i: abs(ladder[i][0] - cs))
+        steps, tested, status = [], set(), None
+        for _ in range(max_steps):
+            jpg, _r, _d = _grab("_test")
+            time.sleep(AUTOEXP_SETTLE_S)           # let the re-enumeration finish
+            stats = jpegstats.luma_stats(jpg) or {}
+            status = stats.get("status")
+            steps.append({"shutter": labels[idx], "mean": stats.get("mean"),
+                          "status": status})
+            tested.add(idx)
+            if status == "ok" or status is None:
+                break
+            if status in ("dark", "under"):
+                nxt = idx + 1                       # longer exposure -> brighter
+            elif status in ("over", "bright"):
+                nxt = idx - 1                       # shorter -> darker
+            else:
+                break
+            if not (0 <= nxt < len(labels)) or nxt in tested:
+                break                              # at an edge, or oscillating
+            idx = nxt
+            cam.configure({"shutterspeed": labels[idx]})
+        return {"ok": True, "final_shutter": labels[idx], "status": status,
+                "steps": steps, "name": "_test.jpg",
+                "exposure": jpegstats.luma_stats(OUT_DIR / "_test.jpg")}
+    finally:
+        cam.retries, cam.backoff = prev_retries, prev_backoff
 
 
 def read_status() -> dict:
