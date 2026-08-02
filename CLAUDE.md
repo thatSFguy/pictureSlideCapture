@@ -282,6 +282,20 @@ Features:
   so Review flags the whole batch with no recompute. Heuristic; a guide, not a
   meter (less reliable on the orange mask of negatives).
 - **File management**: per-image download/delete + download-all zip.
+- **Settings persistence**: sensor-trigger, auto-reshoot, and advance config are
+  saved to `config.json` and restored at startup, so they survive the
+  self-update restart (which used to reset them to off). The trigger + reshoot
+  toggles also load from the lock-free `/api/trigger`, so the UI shows their real
+  state even while the camera is busy.
+- **Camera lock diagnostics**: `cam_lock` records its holder + hold time; a
+  "busy" response says *what* holds it and for *how long* (e.g. `busy: sensor
+  capture (12.3s)`), and `/api/diag` shows `camera_lock`. gphoto2 op timeouts are
+  bounded (config 25s, capture 30s) so a wedged/asleep camera frees the lock
+  promptly instead of pinning it for ~90s.
+- **Lightweight preview**: the Capture-mode last-shot preview loads the tiny
+  embedded thumbnail (few KB), not the full ~3MB frame — click it to load full
+  res. Sensor captures run server-side, so a hands-off batch needs no browser
+  open at all (open Review afterward).
 - **Group prefix**: filenames `<prefix>_0001, _0002, …` (per-prefix numbering,
   resumable, supports >9999; sorted numerically). Sanitized to `[A-Za-z0-9_-]`.
 - **Per-image captions**: added in the Review pass (kept out of the capture loop

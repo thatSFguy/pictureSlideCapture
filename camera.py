@@ -37,7 +37,7 @@ class Camera:
         self.verbose = verbose
         self.last_stdout = ""     # gphoto2 output of the most recent success
 
-    def _run(self, args: list[str], timeout: float = 60.0,
+    def _run(self, args: list[str], timeout: float = 25.0,
              cwd: str | None = None) -> str:
         """Run one gphoto2 command with retry-on-IO-error + backoff. `cwd` sets
         the working directory — gphoto2 needs a WRITABLE cwd to stage a download
@@ -227,4 +227,7 @@ class Camera:
         # Run from the (writable) output dir — gphoto2 stages the download in
         # cwd, so a non-writable cwd silently drops the file. This, not the
         # arg order or capturetarget, was the real "no downloadable file" cause.
-        return self._run(args, timeout=90.0, cwd=str(dest.parent))
+        # 30s is generous (a full RAW cycle is ~5.6s) but bounded, so a wedged
+        # camera (asleep / powered off) releases the caller's lock promptly
+        # instead of pinning it for the old 90s.
+        return self._run(args, timeout=30.0, cwd=str(dest.parent))

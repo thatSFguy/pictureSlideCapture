@@ -30,6 +30,7 @@ import shutil
 import subprocess
 import tempfile
 import threading
+import time
 import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -63,6 +64,39 @@ PREFIX_BAD = re.compile(r"[^A-Za-z0-9_-]+")
 # ---- shared state ---------------------------------------------------------
 cam = Camera(retries=3, backoff=0.8, verbose=True)  # fail fast when camera absent
 cam_lock = threading.Lock()          # camera is single-session: serialize access
+_lock_info = {"who": None, "since": 0.0}   # who holds cam_lock + when they took it
+
+
+def _lock_acquire(who: str, wait: float) -> bool:
+    """Acquire cam_lock, recording the holder + start time for diagnostics.
+    wait<=0 -> non-blocking; else block up to `wait` seconds."""
+    got = (cam_lock.acquire(blocking=False) if wait <= 0
+           else cam_lock.acquire(timeout=wait))
+    if got:
+        _lock_info["who"], _lock_info["since"] = who, time.monotonic()
+    return got
+
+
+def _lock_release() -> None:
+    _lock_info["who"], _lock_info["since"] = None, 0.0
+    cam_lock.release()
+
+
+def lock_status() -> dict | None:
+    """What holds the camera right now (for busy messages + diagnostics)."""
+    who = _lock_info["who"]
+    if not who:
+        return None
+    return {"who": who, "held_s": round(time.monotonic() - _lock_info["since"], 1)}
+
+
+def _busy_json(handler, msg="camera busy") -> None:
+    ls = lock_status()
+    if ls:
+        msg = f"busy: {ls['who']} ({ls['held_s']}s)"
+    handler._json({"ok": False, "busy": True, "error": msg}, 409)
+
+
 OUT_DIR = Path("./captures")
 PREFIX = "slide"
 HAVE_EXIFTOOL = shutil.which("exiftool") is not None
@@ -92,6 +126,7 @@ def set_reshoot(cfg: dict) -> dict:
             RESHOOT["max"] = max(1, min(4, int(cfg["max"])))
         except (TypeError, ValueError):
             pass
+    _persist_config()
     return dict(RESHOOT)
 
 
@@ -103,6 +138,7 @@ def set_advance(cfg: dict) -> dict:
     merged = {**ADVANCE, **{k: cfg[k] for k in ADVANCE_DEFAULTS if k in cfg}}
     new = make_advancer(merged)               # may raise AdvanceError
     ADVANCE, advancer = merged, new
+    _persist_config()
     return ADVANCE
 
 
@@ -120,8 +156,8 @@ def sensor_capture() -> None:
     serialized behind the camera lock so it can't overlap a button-press capture
     or an update. Skips the trigger if the camera is busy — never blocks the
     watcher for long. Never raises (the watcher must survive)."""
-    if not cam_lock.acquire(timeout=8):
-        print("[trigger] camera busy — skipped a sensor trigger")
+    if not _lock_acquire("sensor capture", 8):
+        print(f"[trigger] camera busy ({lock_status()}) — skipped a sensor trigger")
         return
     try:
         res = do_capture()
@@ -130,7 +166,7 @@ def sensor_capture() -> None:
     except CameraError as e:
         print(f"[trigger] capture failed: {friendly(str(e))}")
     finally:
-        cam_lock.release()
+        _lock_release()
 
 
 def set_trigger(cfg: dict) -> dict:
@@ -145,6 +181,7 @@ def set_trigger(cfg: dict) -> dict:
     if trigger is not None:
         trigger.stop()
     trigger, TRIGGER = new, merged
+    _persist_config()
     return TRIGGER
 
 
@@ -157,14 +194,16 @@ def public_trigger() -> dict:
 
 
 def read_sensor() -> dict:
-    """Current raw sensor level + its interpretation (for polarity setup)."""
+    """Current raw sensor level + its interpretation (for polarity setup). Also
+    carries trigger + reshoot config so the Setup UI can restore both toggles
+    without the (lock-gated) status call — they populate even when busy."""
+    base = {"trigger": public_trigger(), "reshoot": dict(RESHOOT)}
     try:
         lvl = read_level(TRIGGER)
     except TriggerError as e:
-        return {"ok": False, "error": str(e), "trigger": public_trigger()}
+        return {"ok": False, "error": str(e), **base}
     obstructed = (lvl == 1) if TRIGGER.get("active_high") else (lvl == 0)
-    return {"ok": True, "level": lvl, "obstructed": obstructed,
-            "trigger": public_trigger()}
+    return {"ok": True, "level": lvl, "obstructed": obstructed, **base}
 
 
 def sanitize_prefix(s: str) -> str:
@@ -286,6 +325,21 @@ def load_exposure() -> dict:
 
 def save_exposure(d: dict) -> None:
     _save_sidecar("exposure.json", d)
+
+
+def load_config() -> dict:
+    """Persisted app settings (sensor trigger, reshoot, advance) so they survive
+    a restart — the service restarts on every self-update, which used to reset
+    these to off."""
+    return _load_sidecar("config.json")
+
+
+def _persist_config() -> None:
+    _save_sidecar("config.json", {
+        "trigger": {k: TRIGGER[k] for k in TRIGGER_DEFAULTS},
+        "reshoot": dict(RESHOOT),
+        "advance": {k: ADVANCE[k] for k in ADVANCE_DEFAULTS},
+    })
 
 
 def _jpeg_strip_comments(data: bytes) -> bytes:
@@ -874,7 +928,8 @@ def read_diag() -> dict:
          "platform": platform.platform(), "out_dir": str(OUT_DIR.resolve()),
          "prefix": PREFIX, "have_exiftool": HAVE_EXIFTOOL,
          "advance_mode": ADVANCE.get("mode"),
-         "trigger": public_trigger(), "reshoot": dict(RESHOOT)}
+         "trigger": public_trigger(), "reshoot": dict(RESHOOT),
+         "camera_lock": lock_status()}
     try:
         d["gphoto2"] = (subprocess.run(["gphoto2", "--version"],
                         capture_output=True, text=True, timeout=10)
@@ -965,34 +1020,33 @@ class Handler(BaseHTTPRequestHandler):
         except (ValueError, json.JSONDecodeError):
             return {}
 
-    def _with_camera(self, fn, wait: float = 6.0):
+    def _with_camera(self, fn, wait: float = 6.0, label: str | None = None):
         # User-initiated camera ops wait briefly for the lock, so a background
         # status poll (which holds it ~1-2s) doesn't turn a click into a
         # spurious "camera busy". Background polls pass wait=0 to fail fast and
         # skip silently.
-        got = (cam_lock.acquire(blocking=False) if wait <= 0
-               else cam_lock.acquire(timeout=wait))
-        if not got:
-            return self._json({"ok": False, "busy": True,
-                               "error": "camera busy"}, 409)
+        who = label or getattr(fn, "__name__", None) or "camera op"
+        if not _lock_acquire(who, wait):
+            return _busy_json(self)
         try:
             self._json(fn())
         except CameraError as e:
             self._json({"ok": False, "error": friendly(str(e))}, 500)
         finally:
-            cam_lock.release()
+            _lock_release()
 
     def _guarded_update(self, check_only: bool):
         # Serialize against capture (same lock) so we never restart mid-shot.
-        if not cam_lock.acquire(blocking=False):
-            return self._json({"ok": False, "busy": True,
-                               "error": "busy — finish the capture first"}, 409)
+        # Wait a few seconds so a shot in flight doesn't instantly block a manual
+        # update, but the tracked holder is reported if it stays busy.
+        if not _lock_acquire("update", 5):
+            return _busy_json(self, "busy — finish the capture first")
         try:
             self._json(update_check() if check_only else update_apply())
         except Exception as e:
             self._json({"ok": False, "error": str(e)}, 500)
         finally:
-            cam_lock.release()
+            _lock_release()
 
     def do_GET(self):
         u = urlparse(self.path)
@@ -1554,7 +1608,12 @@ function renderCap(){
   $('#redo').disabled = !ST.recent.length;
   if(!name){ img.style.display='none'; pl.style.display='block'; $('#chip').style.display='none';
     $('#capName').textContent=''; return; }
-  img.src='/media/'+name+'?t='+Date.now(); img.style.display='block'; pl.style.display='none';
+  // Lightweight preview: the tiny embedded thumbnail (few KB), not the full
+  // ~3MB JPEG — the Pi Zero's WiFi shouldn't push a full frame per shot during
+  // an unattended run. Click to load the full image for a slide worth checking.
+  img.src='/thumb/'+encodeURIComponent(name)+'?t='+Date.now(); img.style.display='block'; pl.style.display='none';
+  img.style.cursor='zoom-in';
+  img.onclick=()=>{ img.src='/media/'+encodeURIComponent(name)+'?t='+Date.now(); };
   $('#capName').textContent=name+(capIdx?' ('+(capIdx+1)+' back)':'');
   chipFor($('#chip'), ST.exposure[name]);
 }
@@ -1666,10 +1725,15 @@ function fillTrig(t){ if(!t) return;
   $('#trigPol').value = t.active_high ? 'high' : 'low';
   if(document.activeElement!==$('#trigLine')) $('#trigLine').value = t.sensor_line;
 }
+function fillReshoot(r){ if(!r) return;
+  if(document.activeElement!==$('#reshootOn')) $('#reshootOn').checked=!!r.enabled;
+  if(document.activeElement!==$('#reshootMax')) $('#reshootMax').value=r.max||1;
+}
 async function loadTrigger(){
-  try{ const d=await jget('/api/trigger'); fillTrig(d.trigger);
-    if(d.trigger && !d.trigger.running) return;
-  }catch(e){}
+  // Restores BOTH the sensor and reshoot toggles from the lock-free endpoint,
+  // so they show the saved state even when the camera is busy.
+  try{ const d=await jget('/api/trigger'); fillTrig(d.trigger); fillReshoot(d.reshoot); }
+  catch(e){}
 }
 async function saveTrigger(){
   const body={ mode: $('#trigOn').checked?'gpio':'off',
@@ -1858,14 +1922,28 @@ def main():
         except CameraError as e:
             print(f"  camera not ready ({e}) — UI will show it; connect + refresh.")
 
-    # Optical-sensor capture trigger (off unless --sensor). Build the watcher
-    # either way so /api/trigger has live config; only "gpio" mode starts a
-    # thread + needs libgpiod.
+    # Restore persisted settings so they survive the self-update restart (which
+    # used to reset sensor/reshoot to off).
+    saved = load_config()
+    if isinstance(saved.get("reshoot"), dict):
+        set_reshoot(saved["reshoot"])
+    if isinstance(saved.get("advance"), dict):
+        try:
+            set_advance(saved["advance"])
+        except AdvanceError as e:
+            print(f"  saved advance config rejected ({e})")
+
+    # Optical-sensor capture trigger. --sensor CLI flags override the saved
+    # config; otherwise restore what was saved. Build the watcher either way so
+    # /api/trigger has live config; only "gpio" mode starts a thread + libgpiod.
+    if args.sensor:
+        trig_cfg = {"mode": "gpio", "sensor_line": args.sensor_line,
+                    "active_high": args.sensor_active_high}
+    else:
+        trig_cfg = saved["trigger"] if isinstance(saved.get("trigger"), dict) else {}
     try:
-        set_trigger({"mode": "gpio", "sensor_line": args.sensor_line,
-                     "active_high": args.sensor_active_high} if args.sensor
-                    else {})
-        if args.sensor:
+        set_trigger(trig_cfg)
+        if trigger.enabled:
             print(f"Sensor trigger:  {trigger.describe()}")
     except TriggerError as e:
         print(f"  sensor trigger not started ({e}) — enable it later in Setup.")
