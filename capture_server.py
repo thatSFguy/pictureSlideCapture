@@ -1639,12 +1639,14 @@ async function saveTrigger(){
     active_high: $('#trigPol').value==='high',
     sensor_line: parseInt($('#trigLine').value,10)||24 };
   $('#trigMsg').textContent='Saving…';
-  const d=await jpost('/api/trigger',body);
-  if(d.ok){ fillTrig(d.trigger);
-    $('#trigMsg').textContent = d.trigger.running
-      ? ('Watching '+d.trigger.describe()+'. Blocking the beam will capture.')
-      : 'Sensor trigger off.'; }
-  else $('#trigMsg').textContent = d.error||'Save failed.';
+  try{
+    const d=await jpost('/api/trigger',body);
+    if(d.ok){ fillTrig(d.trigger);
+      $('#trigMsg').textContent = d.trigger.running
+        ? ('Watching '+d.trigger.describe+'. Blocking the beam will capture.')
+        : 'Sensor trigger off.'; }
+    else $('#trigMsg').textContent = d.error||'Save failed.';
+  }catch(e){ $('#trigMsg').textContent='Save failed (network?).'; }
 }
 async function readSensor(){
   $('#trigMsg').textContent='Reading…';
