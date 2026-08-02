@@ -451,7 +451,12 @@ def _auto_reshoot(stem, jpg, raw, derived, stats):
             "score": _exp_score(stats)}
     try:
         time.sleep(AUTOEXP_SETTLE_S)               # settle after the first capture
-        labels, idx = _shutter_ladder()
+        try:
+            labels, idx = _shutter_ladder()
+        except CameraError as e:                   # can't read shutter -> keep original
+            print(f"[reshoot] can't read shutter, keeping original: "
+                  f"{friendly(str(e))}", flush=True)
+            return jpg, raw, derived, stats, tries
         if idx is None or len(labels) < 2:
             return jpg, raw, derived, stats, tries
         orig_idx, cur = idx, idx
@@ -466,10 +471,18 @@ def _auto_reshoot(stem, jpg, raw, derived, stats):
             if not (0 <= nxt < len(labels)):
                 break                              # at an edge of the ladder
             cur = nxt
-            cam.configure({"shutterspeed": labels[cur]})
-            time.sleep(AUTOEXP_SETTLE_S)
-            tstem = f"_reshoot{k}"
-            tj, tr, td = _grab(tstem)
+            # A reshoot capture fires right after a capture, in the 400D's USB
+            # re-enumeration window — if it errors, keep the best so far (the
+            # original is already saved) instead of failing the whole capture,
+            # which would leave the frame unmetered ("exposure n/a").
+            try:
+                cam.configure({"shutterspeed": labels[cur]})
+                time.sleep(AUTOEXP_SETTLE_S)
+                tj, tr, td = _grab(f"_reshoot{k}")
+            except CameraError as e:
+                print(f"[reshoot] capture failed at {labels[cur]}, keeping best: "
+                      f"{friendly(str(e))}", flush=True)
+                break
             ts = jpegstats.luma_stats(tj)
             tries.append({"shutter": labels[cur], "status": (ts or {}).get("status"),
                           "mean": (ts or {}).get("mean")})
@@ -479,7 +492,10 @@ def _auto_reshoot(stem, jpg, raw, derived, stats):
             if (ts or {}).get("status") == "ok":
                 break
         if cur != orig_idx:                        # restore baseline for next slide
-            cam.configure({"shutterspeed": labels[orig_idx]})
+            try:
+                cam.configure({"shutterspeed": labels[orig_idx]})
+            except CameraError:
+                pass                               # best-effort; next capture retries
     finally:
         cam.retries, cam.backoff = prev
     # Promote the winner onto the real stem (if a reshoot won) and clear temps.

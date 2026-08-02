@@ -143,52 +143,50 @@ class SensorTrigger:
         self._log(f"[trigger] watching {self.describe()}")
 
     def _run(self) -> None:
+        # One gpiomon per event (--num-events 1): the process exits the instant
+        # the edge fires, which flushes its output and returns to us immediately.
+        # A long-lived streaming gpiomon block-buffers its pipe (and Python adds
+        # read-ahead), so edges arrived seconds late — the capture lagged the
+        # beam break. The only gap this introduces is between one exit and the
+        # next start (~tens of ms), which lands during the post-capture cooldown
+        # when no new slide is due, so no real edge is missed.
         args = gpiocli.with_sudo(
-            gpiocli.mon_cmd(self.chip, self.line, self.edge, self.bias),
+            gpiocli.mon_cmd(self.chip, self.line, self.edge, self.bias,
+                            num_events=1),
             self.chip, self.line, self.bias)
         fails = 0
+        last = 0.0
         while not self._stop.is_set():
             try:
                 self._proc = subprocess.Popen(
-                    args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                    text=True, bufsize=1)
+                    args, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                    text=True)
             except OSError as e:
                 self._log(f"[trigger] cannot start gpiomon: {e}")
                 return
-            started = time.monotonic()
-            last = 0.0
-            for _line in self._proc.stdout:            # one line == one edge
-                if self._stop.is_set():
-                    break
-                now = time.monotonic()
-                if now - last < self.cooldown:
-                    continue                           # debounce / bounce burst
-                last = now
-                fails = 0
-                try:
-                    self._on_trigger()
-                except Exception as e:                 # never kill the watcher
-                    self._log(f"[trigger] capture callback error: {e}")
-                last = time.monotonic()                # re-arm cooldown post-capture
-            err = ""
-            try:
-                err = (self._proc.stderr.read() or "").strip()
-            except Exception:
-                pass
-            self._proc.wait()
-            if self._stop.is_set():
+            _out, err = self._proc.communicate()       # blocks until the 1 edge
+            rc = self._proc.returncode
+            if self._stop.is_set():                    # terminated by stop()
                 break
-            # Unexpected exit. A near-instant exit means a config/tool problem
-            # (bad line, unsupported --bias) — don't spin forever on it.
-            if time.monotonic() - started < 1.0:
+            if rc != 0:                                # error, not an edge
                 fails += 1
+                msg = (err or "").strip() or f"exit {rc}"
                 if fails >= 3:
-                    self._log("[trigger] giving up after repeated gpiomon "
-                              f"failures: {err or 'unknown error'}")
+                    self._log(f"[trigger] giving up after gpiomon errors: {msg}")
                     return
-            self._log(f"[trigger] gpiomon exited ({err or 'no error'}); "
-                      "restarting in 1s")
-            self._stop.wait(1.0)
+                self._log(f"[trigger] gpiomon error ({msg}); retrying in 1s")
+                self._stop.wait(1.0)
+                continue
+            fails = 0
+            now = time.monotonic()
+            if now - last < self.cooldown:             # debounce / ignore bounce
+                continue
+            last = now
+            try:
+                self._on_trigger()
+            except Exception as e:                     # never kill the watcher
+                self._log(f"[trigger] capture callback error: {e}")
+            last = time.monotonic()                    # re-arm cooldown post-capture
 
     def stop(self) -> None:
         self._stop.set()
