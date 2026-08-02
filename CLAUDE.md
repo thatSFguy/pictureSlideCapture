@@ -210,6 +210,26 @@ Files (all in repo root, stdlib only):
   calls it after each capture when enabled (`after_capture`); a failed advance
   is reported in the response, never fatal (image is already saved). Motor path
   is written but UNTESTED on hardware — first run is a bring-up.
+- `trigger.py` — optical-sensor capture trigger (settings-driven, default
+  `off`). A background daemon thread reads one long-lived `gpiomon` (libgpiod
+  via subprocess, same pattern as advance.py — needs `apt install gpiod`, now in
+  the appliance image) and fires a capture on the **unobstructed→obstructed**
+  edge. **Polarity is configurable** because sensor OUT idle state varies:
+  `active_high=False` (default) treats obstructed as LOW → **falling** edge;
+  `active_high=True` → **rising** edge. `bias` sets an internal pull-up (default,
+  gives an open-collector sensor a defined idle) / pull-down / disable.
+  `cooldown_s` debounces + prevents a double-fire during the capture's own
+  download. `read_level()` (`gpioget`) reads the raw 0/1 so polarity can be
+  discovered by blocking the beam. The trigger callback (`sensor_capture`) is
+  serialized behind the same `cam_lock`, so a sensor shot and a button press
+  never overlap; if the camera is busy the trigger is skipped, not queued.
+  Wiring (Pi 40-pin): **OUT→GPIO24 (phys pin 18)**, **VCC→3V3 (pin 1)**,
+  **GND→pin 6**. Power from 3V3 so OUT can't exceed the Pi's 3.3V-only GPIO; if
+  the sensor needs 5V (pin 2/4), level-shift/divide OUT down to 3.3V first.
+  Endpoints: `GET /api/trigger` (config + live level), `POST /api/trigger`
+  (apply `mode`/`active_high`/`sensor_line`…). CLI: `--sensor`,
+  `--sensor-line N`, `--sensor-active-high`. Configurable from the UI
+  (Setup → Sensor trigger); UNTESTED on hardware — first run is a bring-up.
 - `scanner.py` — gantry batch loop (deferred phase), reuses `camera.py`.
 
 UI — three modes (built for high-volume, keyboard-first; see the redesign plan

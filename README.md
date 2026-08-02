@@ -99,6 +99,7 @@ exposure aid. Focus once, manually, on the film plane. Full rationale in
 | `camera.py` | gphoto2 wrapper: detect, get/set config, capture, retries |
 | `jpegstats.py` | Pure-stdlib JPEG brightness reader for the exposure aid |
 | `advance.py` | Auto slide-advance output (stub): capture → advance → repeat, settings-driven (motor+switch / stepper); default off |
+| `trigger.py` | Optical-sensor capture trigger: auto-captures on the beam-blocked edge, polarity configurable; default off |
 | `scanner.py` | Gantry dead-reckoning batch loop (deferred automation phase) |
 | `CLAUDE.md` | Detailed hardware, protocol, and development notes |
 

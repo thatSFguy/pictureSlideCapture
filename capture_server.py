@@ -38,6 +38,7 @@ from urllib.parse import unquote, urlparse, parse_qs
 import jpegstats
 from advance import ADVANCE_DEFAULTS, AdvanceError, make_advancer
 from camera import Camera, CameraError
+from trigger import TRIGGER_DEFAULTS, TriggerError, make_trigger, read_level
 
 # ---- configuration (edit freely) -----------------------------------------
 # capturetarget is set per-capture inside cam.capture() (avoids the 400D
@@ -70,6 +71,11 @@ HAVE_EXIFTOOL = shutil.which("exiftool") is not None
 ADVANCE = dict(ADVANCE_DEFAULTS)
 advancer = make_advancer(ADVANCE)
 
+# Optical-sensor capture trigger (default "off" == no-op). See trigger.py.
+# Built lazily in main() once sensor_capture() is defined below.
+TRIGGER = dict(TRIGGER_DEFAULTS)
+trigger = None
+
 
 def set_advance(cfg: dict) -> dict:
     """Merge new advance settings and rebuild the advancer. Lock held.
@@ -89,6 +95,58 @@ def _advance_once() -> dict:
         return {"ok": True, "mode": advancer.mode}
     except (AdvanceError, NotImplementedError) as e:
         return {"ok": False, "error": str(e) or "advance not implemented"}
+
+
+def sensor_capture() -> None:
+    """Sensor-trigger callback (runs on the trigger thread). Capture one frame,
+    serialized behind the camera lock so it can't overlap a button-press capture
+    or an update. Skips the trigger if the camera is busy — never blocks the
+    watcher for long. Never raises (the watcher must survive)."""
+    if not cam_lock.acquire(timeout=8):
+        print("[trigger] camera busy — skipped a sensor trigger")
+        return
+    try:
+        res = do_capture()
+        status = (res.get("exposure") or {}).get("status", "?")
+        print(f"[trigger] captured {res.get('name')} [{status}]")
+    except CameraError as e:
+        print(f"[trigger] capture failed: {friendly(str(e))}")
+    finally:
+        cam_lock.release()
+
+
+def set_trigger(cfg: dict) -> dict:
+    """Merge new trigger settings and (re)start the watcher. Validates by
+    building + starting a fresh SensorTrigger before swapping — if it can't
+    build/start (bad config or missing gpiomon while enabled), the live watcher
+    is left untouched and TriggerError propagates."""
+    global TRIGGER, trigger
+    merged = {**TRIGGER, **{k: cfg[k] for k in TRIGGER_DEFAULTS if k in cfg}}
+    new = make_trigger(merged, sensor_capture)   # may raise TriggerError
+    new.start()                                  # may raise (enabled + no tool)
+    if trigger is not None:
+        trigger.stop()
+    trigger, TRIGGER = new, merged
+    return TRIGGER
+
+
+def public_trigger() -> dict:
+    """Trigger config for the API/UI, plus a human-readable summary."""
+    d = dict(TRIGGER)
+    d["describe"] = trigger.describe() if trigger is not None else "off"
+    d["running"] = bool(trigger is not None and trigger.enabled)
+    return d
+
+
+def read_sensor() -> dict:
+    """Current raw sensor level + its interpretation (for polarity setup)."""
+    try:
+        lvl = read_level(TRIGGER)
+    except TriggerError as e:
+        return {"ok": False, "error": str(e), "trigger": public_trigger()}
+    obstructed = (lvl == 1) if TRIGGER.get("active_high") else (lvl == 0)
+    return {"ok": True, "level": lvl, "obstructed": obstructed,
+            "trigger": public_trigger()}
 
 
 def sanitize_prefix(s: str) -> str:
@@ -630,7 +688,8 @@ def read_diag() -> dict:
     d = {"version": app_version(), "python": sys.version.split()[0],
          "platform": platform.platform(), "out_dir": str(OUT_DIR.resolve()),
          "prefix": PREFIX, "have_exiftool": HAVE_EXIFTOOL,
-         "advance_mode": ADVANCE.get("mode")}
+         "advance_mode": ADVANCE.get("mode"),
+         "trigger": public_trigger()}
     try:
         d["gphoto2"] = (subprocess.run(["gphoto2", "--version"],
                         capture_output=True, text=True, timeout=10)
@@ -773,6 +832,8 @@ class Handler(BaseHTTPRequestHandler):
             self._json(read_logs(n))
         elif path == "/api/diag":
             self._with_camera(read_diag)   # camera snapshot needs the lock
+        elif path == "/api/trigger":
+            self._json(read_sensor())      # config + live level (for polarity)
         elif path == "/api/exposure":
             f = self._safe(unquote(q.get("name", [""])[0]))
             stats = jpegstats.luma_stats(f) if f and f.is_file() else None
@@ -801,6 +862,14 @@ class Handler(BaseHTTPRequestHandler):
             self._with_camera(auto_expose, wait=10)   # multi-shot; holds lock
         elif path == "/api/advance":
             self._with_camera(do_advance)   # lock: never advance mid-capture
+        elif path == "/api/trigger":
+            body = self._body()
+            try:
+                set_trigger(body)
+                self._json({"ok": True, "trigger": public_trigger()})
+            except TriggerError as e:
+                self._json({"ok": False, "error": str(e),
+                            "trigger": public_trigger()}, 400)
         elif path == "/api/debugcapture":
             self._with_camera(debug_capture, wait=15)   # diagnostic (alpha)
         elif path == "/api/update":
@@ -1130,6 +1199,23 @@ INDEX_HTML = r"""<!doctype html>
         </div>
         <pre id="diagOut"></pre>
       </div>
+      <div class="card">
+        <h3>Sensor trigger (optional)</h3>
+        <label class="tog"><input type="checkbox" id="trigOn">Auto-capture when the beam is blocked</label>
+        <div class="grid2" style="margin-top:.5rem">
+          <div><label>When blocked, OUT goes</label><select id="trigPol">
+            <option value="low">LOW (active-low — typical)</option>
+            <option value="high">HIGH (active-high)</option>
+          </select></div>
+          <div><label>GPIO line (BCM)</label><input id="trigLine" type="number" min="0" max="27"></div>
+        </div>
+        <div class="diagrow" style="margin-top:.5rem">
+          <button id="trigSave">Save</button>
+          <button id="trigRead">Read sensor now</button>
+        </div>
+        <div class="note" id="trigMsg">Wire OUT→GPIO24 (pin 18), VCC→3V3 (pin 1), GND→pin 6.
+          Not sure of the polarity? Block the beam and hit “Read sensor now”.</div>
+      </div>
      </div>
     </div>
     <button id="startCap">Start capturing →</button>
@@ -1209,7 +1295,7 @@ function setMode(m){
   document.querySelectorAll('.view').forEach(v=>v.classList.remove('active'));
   $('#view-'+m).classList.add('active');
   document.querySelectorAll('nav button').forEach(b=>b.classList.toggle('active',b.dataset.mode===m));
-  if(m==='setup'){ loadSettings(); loadVersion(); }
+  if(m==='setup'){ loadSettings(); loadVersion(); loadTrigger(); }
   if(m==='review') loadReview(true);
   if(m==='capture'){ capIdx=0; renderCap(); }
 }
@@ -1345,6 +1431,38 @@ async function applyUpdate(to){
   }, 1500);
 }
 
+/* ---- sensor trigger ---- */
+function fillTrig(t){ if(!t) return;
+  $('#trigOn').checked = (t.mode==='gpio');
+  $('#trigPol').value = t.active_high ? 'high' : 'low';
+  if(document.activeElement!==$('#trigLine')) $('#trigLine').value = t.sensor_line;
+}
+async function loadTrigger(){
+  try{ const d=await jget('/api/trigger'); fillTrig(d.trigger);
+    if(d.trigger && !d.trigger.running) return;
+  }catch(e){}
+}
+async function saveTrigger(){
+  const body={ mode: $('#trigOn').checked?'gpio':'off',
+    active_high: $('#trigPol').value==='high',
+    sensor_line: parseInt($('#trigLine').value,10)||24 };
+  $('#trigMsg').textContent='Saving…';
+  const d=await jpost('/api/trigger',body);
+  if(d.ok){ fillTrig(d.trigger);
+    $('#trigMsg').textContent = d.trigger.running
+      ? ('Watching '+d.trigger.describe()+'. Blocking the beam will capture.')
+      : 'Sensor trigger off.'; }
+  else $('#trigMsg').textContent = d.error||'Save failed.';
+}
+async function readSensor(){
+  $('#trigMsg').textContent='Reading…';
+  const d=await jget('/api/trigger');
+  if(d.ok===false){ $('#trigMsg').textContent=d.error||'Read failed.'; return; }
+  $('#trigMsg').textContent = 'Sensor reads '+d.level+' → '
+    + (d.obstructed?'OBSTRUCTED':'clear')
+    + ' (with the current polarity). Block/clear the beam and read again to confirm.';
+}
+
 /* ---- diagnostics ---- */
 async function showDiag(){
   const o=$('#diagOut'); o.style.display='block'; o.textContent='Loading diagnostics…';
@@ -1408,6 +1526,7 @@ $('#applyPrefix').onclick=applyPrefix; $('#testShot').onclick=testShot;
 $('#autoExp').onclick=autoExpose;
 $('#checkUpd').onclick=checkUpdate;
 $('#diagBtn').onclick=showDiag; $('#logBtn').onclick=showLogs;
+$('#trigSave').onclick=saveTrigger; $('#trigRead').onclick=readSensor;
 $('#startCap').onclick=()=>setMode('capture');
 $('#shoot').onclick=capture; $('#redo').onclick=redoLast;
 $('#revRefresh').onclick=()=>loadReview(true); $('#flagOnly').onchange=renderGrid;
@@ -1448,6 +1567,13 @@ def main():
     p.add_argument("--out-dir", default="./captures")
     p.add_argument("--prefix", default="slide")
     p.add_argument("--no-setup", action="store_true")
+    p.add_argument("--sensor", action="store_true",
+                   help="enable the optical-sensor capture trigger (GPIO)")
+    p.add_argument("--sensor-line", type=int,
+                   default=TRIGGER_DEFAULTS["sensor_line"],
+                   help="BCM line wired to the sensor OUT (default %(default)s = phys pin 18)")
+    p.add_argument("--sensor-active-high", action="store_true",
+                   help="sensor OUT goes HIGH when obstructed (default: LOW)")
     args = p.parse_args()
 
     OUT_DIR = Path(args.out_dir)
@@ -1466,6 +1592,18 @@ def main():
                 print("  NOTE: dial not on M — exposure settings won't apply.")
         except CameraError as e:
             print(f"  camera not ready ({e}) — UI will show it; connect + refresh.")
+
+    # Optical-sensor capture trigger (off unless --sensor). Build the watcher
+    # either way so /api/trigger has live config; only "gpio" mode starts a
+    # thread + needs libgpiod.
+    try:
+        set_trigger({"mode": "gpio", "sensor_line": args.sensor_line,
+                     "active_high": args.sensor_active_high} if args.sensor
+                    else {})
+        if args.sensor:
+            print(f"Sensor trigger:  {trigger.describe()}")
+    except TriggerError as e:
+        print(f"  sensor trigger not started ({e}) — enable it later in Setup.")
 
     srv = ThreadingHTTPServer((args.host, args.port), Handler)
     print(f"\nServing at http://{args.host}:{args.port}  (Ctrl-C to stop)")
