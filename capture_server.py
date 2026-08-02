@@ -701,13 +701,24 @@ def apply_settings(body: dict) -> dict:
     return out
 
 
+def _mtime(f: Path) -> int:
+    try:
+        return int(f.stat().st_mtime)
+    except OSError:
+        return 0
+
+
 def read_images(offset: int, limit: int) -> dict:
-    """Paginated listing of the current group for Review (no camera needed)."""
+    """Paginated listing of the current group for Review (no camera needed).
+    Each item carries `mtime` so the UI can cache-bust /thumb and /media: group
+    filenames are reused (numbering restarts after a delete-all), so a new frame
+    can land on an old name — without the mtime in the URL the browser serves the
+    stale cached image."""
     imgs = group_images(PREFIX)                    # newest first
     caps, ex = load_captions(), load_exposure()
     page = imgs[offset:offset + limit]
     items = [{"name": f.name, "caption": caps.get(f.name, ""),
-              "exposure": ex.get(f.name, "")} for f in page]
+              "exposure": ex.get(f.name, ""), "mtime": _mtime(f)} for f in page]
     return {"prefix": PREFIX, "total": len(imgs), "offset": offset,
             "limit": limit, "items": items}
 
@@ -1694,7 +1705,7 @@ async function showLogs(){
 /* ---- review ---- */
 function eclass(st){ if(!st) return 'e-none'; if(st==='ok') return 'e-ok';
   if(st==='under'||st==='over') return 'e-bad'; return 'e-warn'; }
-function revSig(items){ return (items||[]).map(i=>i.name+':'+(i.caption||'')+':'+(i.exposure||'')).join('|'); }
+function revSig(items){ return (items||[]).map(i=>i.name+':'+(i.caption||'')+':'+(i.exposure||'')+':'+(i.mtime||0)).join('|'); }
 async function loadReview(reset){
   if(reset){ rev.items=[]; rev.offset=0; }
   const d=await jget('/api/images?offset='+rev.offset+'&limit='+rev.limit);
@@ -1730,7 +1741,7 @@ function renderGrid(){
   items.forEach((it)=>{
     const idx=rev.items.indexOf(it);
     const t=document.createElement('div'); t.className='tile';
-    t.innerHTML='<img loading="lazy" src="/thumb/'+encodeURIComponent(it.name)+'">'
+    t.innerHTML='<img loading="lazy" src="/thumb/'+encodeURIComponent(it.name)+'?v='+(it.mtime||0)+'">'
       +'<span class="edot '+eclass(it.exposure)+'"></span>'
       +(it.caption?'<span class="cap">'+it.caption.replace(/</g,'&lt;')+'</span>':'');
     t.onclick=()=>openLB(idx); g.appendChild(t);
@@ -1738,7 +1749,7 @@ function renderGrid(){
   $('#loadMore').style.display = (!$('#flagOnly').checked && rev.items.length<rev.total)?'block':'none';
 }
 function openLB(idx){ rev.lbIdx=idx; const it=rev.items[idx]; if(!it) return;
-  $('#lbImg').src='/media/'+encodeURIComponent(it.name)+'?t='+Date.now();
+  $('#lbImg').src='/media/'+encodeURIComponent(it.name)+'?v='+(it.mtime||Date.now());
   $('#lbCaption').value=it.caption||'';
   $('#lbInfo').textContent=it.name+'  ·  '+(EXPO[it.exposure]?EXPO[it.exposure][0]:'exposure n/a');
   $('#lb').classList.add('open');
