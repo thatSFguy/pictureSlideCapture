@@ -82,7 +82,8 @@ def read_level(settings: dict) -> int:
         line = int(_cfg(settings, "sensor_line"))
     except (TypeError, ValueError) as e:
         raise TriggerError(f"bad sensor_line: {e}")
-    args = gpiocli.get_cmd(chip, line, _cfg(settings, "bias"))
+    bias = _cfg(settings, "bias")
+    args = gpiocli.with_sudo(gpiocli.get_cmd(chip, line, bias), chip, line, bias)
     try:
         r = subprocess.run(args, capture_output=True, text=True, timeout=5)
     except (OSError, subprocess.TimeoutExpired) as e:
@@ -142,7 +143,9 @@ class SensorTrigger:
         self._log(f"[trigger] watching {self.describe()}")
 
     def _run(self) -> None:
-        args = gpiocli.mon_cmd(self.chip, self.line, self.edge, self.bias)
+        args = gpiocli.with_sudo(
+            gpiocli.mon_cmd(self.chip, self.line, self.edge, self.bias),
+            self.chip, self.line, self.bias)
         fails = 0
         while not self._stop.is_set():
             try:

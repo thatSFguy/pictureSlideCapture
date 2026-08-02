@@ -22,6 +22,12 @@ echo ">>> creating appliance user '$TARGET_USER'..."
 if ! id "$TARGET_USER" >/dev/null 2>&1; then
   useradd -m -s /bin/bash -G plugdev,sudo "$TARGET_USER"
 fi
+# GPIO access for the sensor trigger + motor advance: /dev/gpiochip* is root:gpio
+# (Pi OS ships the group + udev rules), so put the user in gpio to avoid needing
+# sudo for libgpiod. Create the group if a base image lacks it. (The app also
+# has a sudo -n fallback for boxes provisioned before this line.)
+getent group gpio >/dev/null || groupadd -r gpio
+usermod -aG gpio "$TARGET_USER"
 # key-only maintenance user -> passwordless sudo (no password exists to prompt)
 echo "$TARGET_USER ALL=(ALL) NOPASSWD:ALL" >/etc/sudoers.d/010-$TARGET_USER
 chmod 440 /etc/sudoers.d/010-$TARGET_USER

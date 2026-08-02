@@ -96,3 +96,49 @@ def set_hold_cmd(chip, line, value) -> list[str]:
     if major() >= 2:
         return ["gpioset", "-c", str(chip), f"{line}={value}"]
     return ["gpioset", "--mode=signal", str(chip), f"{line}={value}"]
+
+
+# ---- privilege handling ---------------------------------------------------
+# /dev/gpiochip* is root:gpio (mode 660). If the running user isn't in the gpio
+# group the CLI fails with "Permission denied". On the appliance the service
+# user (scanner) has passwordless sudo, so we can fall back to `sudo -n`; on a
+# dev box where the user CAN access GPIO directly (or sudo would prompt) we don't.
+_need_sudo = None            # tri-state cache: None=unprobed, True/False
+
+
+@functools.lru_cache(maxsize=1)
+def _sudo_ok() -> bool:
+    if shutil.which("sudo") is None:
+        return False
+    try:
+        return subprocess.run(["sudo", "-n", "true"], capture_output=True,
+                              timeout=5).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def needs_sudo(chip="gpiochip0", line=0, bias="as-is") -> bool:
+    """Probe once whether GPIO access needs sudo (a direct gpioget hits
+    'Permission denied' and passwordless sudo is available). Cached."""
+    global _need_sudo
+    if _need_sudo is not None:
+        return _need_sudo
+    if shutil.which("gpioget") is None:
+        _need_sudo = False
+        return False
+    try:
+        r = subprocess.run(get_cmd(chip, line, bias), capture_output=True,
+                           text=True, timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        _need_sudo = False
+        return False
+    _need_sudo = (r.returncode != 0
+                  and "permission denied" in (r.stderr or "").lower()
+                  and _sudo_ok())
+    return _need_sudo
+
+
+def with_sudo(argv, chip="gpiochip0", line=0, bias="as-is") -> list[str]:
+    """Prepend `sudo -n` to a gpio argv when direct access is denied but
+    passwordless sudo works; otherwise return it unchanged."""
+    return (["sudo", "-n", *argv] if needs_sudo(chip, line, bias) else argv)

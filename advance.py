@@ -123,12 +123,15 @@ class MotorAdvancer(Advancer):
         # Energize (hold the line), wait for the switch edge bounded by timeout,
         # then release the line to de-energize. gpiocli builds the right argv for
         # the installed libgpiod (v1 vs v2).
-        hold = subprocess.Popen(
-            gpiocli.set_hold_cmd(self.chip, self.motor_line, self.motor_on))
+        hold = subprocess.Popen(gpiocli.with_sudo(
+            gpiocli.set_hold_cmd(self.chip, self.motor_line, self.motor_on),
+            self.chip, self.motor_line))
         try:
             r = subprocess.run(
-                gpiocli.mon_cmd(self.chip, self.switch_line, self.switch_edge,
-                                num_events=1),
+                gpiocli.with_sudo(
+                    gpiocli.mon_cmd(self.chip, self.switch_line,
+                                    self.switch_edge, num_events=1),
+                    self.chip, self.switch_line),
                 timeout=self.timeout_s)
             if r.returncode != 0:
                 raise AdvanceError("switch never tripped (motor/switch wiring?)")
