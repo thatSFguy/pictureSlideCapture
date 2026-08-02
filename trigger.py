@@ -96,12 +96,19 @@ def read_level(settings: dict) -> int:
         raise TriggerError(f"unexpected gpioget output: {r.stdout!r}")
 
 
+def _log_print(msg) -> None:
+    """Default logger — flush so lines reach the systemd journal promptly (a
+    plain print() to a pipe is block-buffered, which would hide trigger events
+    from the in-app log view until the buffer fills)."""
+    print(msg, flush=True)
+
+
 class SensorTrigger:
     """Background watcher that fires `on_trigger` on the sensor's
     unobstructed->obstructed edge. No-op (never starts a thread) unless
     mode == 'gpio'."""
 
-    def __init__(self, settings: dict, on_trigger, log=print):
+    def __init__(self, settings: dict, on_trigger, log=_log_print):
         self._on_trigger = on_trigger
         self._log = log
         self.mode = str(_cfg(settings, "mode")).lower()
@@ -143,50 +150,74 @@ class SensorTrigger:
         self._log(f"[trigger] watching {self.describe()}")
 
     def _run(self) -> None:
-        # One gpiomon per event (--num-events 1): the process exits the instant
-        # the edge fires, which flushes its output and returns to us immediately.
-        # A long-lived streaming gpiomon block-buffers its pipe (and Python adds
-        # read-ahead), so edges arrived seconds late — the capture lagged the
-        # beam break. The only gap this introduces is between one exit and the
-        # next start (~tens of ms), which lands during the post-capture cooldown
-        # when no new slide is due, so no real edge is missed.
+        # ONE long-lived gpiomon that streams every edge — so an edge that lands
+        # DURING a capture is still seen (it buffers, we process it right after)
+        # instead of being missed. To keep it prompt (a plain streaming pipe gets
+        # block-buffered by libc + Python read-ahead, which lagged edges by
+        # seconds), force line-buffered output with `stdbuf -oL` and read with
+        # readline() (no read-ahead).
         args = gpiocli.with_sudo(
-            gpiocli.mon_cmd(self.chip, self.line, self.edge, self.bias,
-                            num_events=1),
+            gpiocli.mon_cmd(self.chip, self.line, self.edge, self.bias),
             self.chip, self.line, self.bias)
+        args = self._line_buffered(args)
+        self._log(f"[trigger] watcher cmd: {' '.join(args)}")
         fails = 0
         last = 0.0
         while not self._stop.is_set():
             try:
                 self._proc = subprocess.Popen(
-                    args, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-                    text=True)
+                    args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    text=True, bufsize=1)
             except OSError as e:
                 self._log(f"[trigger] cannot start gpiomon: {e}")
                 return
-            _out, err = self._proc.communicate()       # blocks until the 1 edge
-            rc = self._proc.returncode
-            if self._stop.is_set():                    # terminated by stop()
-                break
-            if rc != 0:                                # error, not an edge
-                fails += 1
-                msg = (err or "").strip() or f"exit {rc}"
-                if fails >= 3:
-                    self._log(f"[trigger] giving up after gpiomon errors: {msg}")
-                    return
-                self._log(f"[trigger] gpiomon error ({msg}); retrying in 1s")
-                self._stop.wait(1.0)
-                continue
-            fails = 0
-            now = time.monotonic()
-            if now - last < self.cooldown:             # debounce / ignore bounce
-                continue
-            last = now
+            started = time.monotonic()
+            while not self._stop.is_set():
+                line = self._proc.stdout.readline()
+                if line == "":                         # EOF -> gpiomon exited
+                    break
+                fails = 0
+                now = time.monotonic()
+                if now - last < self.cooldown:         # debounce / bounce
+                    self._log(f"[trigger] edge ignored (within {self.cooldown:g}s "
+                              "cooldown)")
+                    continue
+                last = now
+                self._log("[trigger] edge detected -> capturing")
+                try:
+                    self._on_trigger()
+                except Exception as e:                 # never kill the watcher
+                    self._log(f"[trigger] capture callback error: {e}")
+                last = time.monotonic()                # re-arm cooldown post-capture
+            err = ""
             try:
-                self._on_trigger()
-            except Exception as e:                     # never kill the watcher
-                self._log(f"[trigger] capture callback error: {e}")
-            last = time.monotonic()                    # re-arm cooldown post-capture
+                err = (self._proc.stderr.read() or "").strip()
+            except Exception:
+                pass
+            self._proc.wait()
+            if self._stop.is_set():
+                break
+            if time.monotonic() - started < 1.0:       # near-instant exit = config/tool error
+                fails += 1
+                if fails >= 3:
+                    self._log(f"[trigger] giving up after gpiomon errors: "
+                              f"{err or 'unknown'}")
+                    return
+            self._log(f"[trigger] gpiomon exited ({err or 'no error'}); "
+                      "restarting in 1s")
+            self._stop.wait(1.0)
+
+    @staticmethod
+    def _line_buffered(args: list[str]) -> list[str]:
+        """Prepend `stdbuf -oL` to the gpiomon program so each edge line is
+        flushed immediately (skipped if stdbuf isn't installed)."""
+        if shutil.which("stdbuf") is None:
+            return args
+        try:
+            i = args.index("gpiomon")
+        except ValueError:
+            return args
+        return args[:i] + ["stdbuf", "-oL"] + args[i:]
 
     def stop(self) -> None:
         self._stop.set()
@@ -199,7 +230,7 @@ class SensorTrigger:
             self._thread.join(timeout=3)
 
 
-def make_trigger(settings: dict, on_trigger, log=print) -> SensorTrigger:
+def make_trigger(settings: dict, on_trigger, log=_log_print) -> SensorTrigger:
     """Build (but don't start) the configured trigger. Kept parallel to
     advance.make_advancer for consistency."""
     return SensorTrigger(settings, on_trigger, log=log)

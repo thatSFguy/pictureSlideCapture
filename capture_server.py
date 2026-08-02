@@ -156,15 +156,21 @@ def sensor_capture() -> None:
     serialized behind the camera lock so it can't overlap a button-press capture
     or an update. Skips the trigger if the camera is busy — never blocks the
     watcher for long. Never raises (the watcher must survive)."""
+    t0 = time.monotonic()
     if not _lock_acquire("sensor capture", 8):
-        print(f"[trigger] camera busy ({lock_status()}) — skipped a sensor trigger")
+        print(f"[trigger] camera busy ({lock_status()}) — SKIPPED this slide",
+              flush=True)
         return
     try:
         res = do_capture()
         status = (res.get("exposure") or {}).get("status", "?")
-        print(f"[trigger] captured {res.get('name')} [{status}]")
+        rs = res.get("reshoots") or []
+        print(f"[trigger] captured {res.get('name')} [{status}] in "
+              f"{time.monotonic() - t0:.1f}s"
+              + (f" (reshot x{len(rs)})" if rs else ""), flush=True)
     except CameraError as e:
-        print(f"[trigger] capture failed: {friendly(str(e))}")
+        print(f"[trigger] capture FAILED after {time.monotonic() - t0:.1f}s: "
+              f"{friendly(str(e))}", flush=True)
     finally:
         _lock_release()
 
@@ -1464,6 +1470,8 @@ INDEX_HTML = r"""<!doctype html>
         <div class="diagrow">
           <button id="diagBtn">Camera diagnostics</button>
           <button id="logBtn">View logs</button>
+          <button id="logRefresh">↻</button>
+          <button id="copyOut">📋 Copy</button>
         </div>
         <pre id="diagOut"></pre>
       </div>
@@ -1766,16 +1774,34 @@ async function saveReshoot(){
 }
 
 /* ---- diagnostics ---- */
+let lastShown='';     // 'diag' | 'logs' — so ↻ refreshes whatever's on screen
 async function showDiag(){
+  lastShown='diag';
   const o=$('#diagOut'); o.style.display='block'; o.textContent='Loading diagnostics…';
   try{ o.textContent=JSON.stringify(await jget('/api/diag'),null,2); }
   catch(e){ o.textContent='Failed to load diagnostics.'; }
 }
 async function showLogs(){
+  lastShown='logs';
   const o=$('#diagOut'); o.style.display='block'; o.textContent='Loading logs…';
-  try{ const d=await jget('/api/logs?lines=400');
+  try{ const d=await jget('/api/logs?lines=800');
     o.textContent = d.ok ? d.text : ('logs unavailable: '+(d.error||'?')); }
   catch(e){ o.textContent='Failed to load logs.'; }
+}
+function refreshOut(){ if(lastShown==='diag') showDiag(); else showLogs(); }
+// Copy that also works over plain http:// (the async clipboard API needs a
+// secure context, which a LAN IP isn't) — fall back to a hidden textarea.
+async function copyText(t){
+  try{ if(navigator.clipboard && window.isSecureContext){ await navigator.clipboard.writeText(t); return true; } }catch(e){}
+  try{ const ta=document.createElement('textarea'); ta.value=t;
+    ta.style.position='fixed'; ta.style.top='-1000px'; document.body.appendChild(ta);
+    ta.focus(); ta.select(); const ok=document.execCommand('copy'); document.body.removeChild(ta); return ok;
+  }catch(e){ return false; }
+}
+async function copyOut(){
+  const t=$('#diagOut').textContent||'';
+  if(!t.trim()){ toast('Nothing to copy — tap View logs first','err'); return; }
+  toast(await copyText(t) ? 'Copied to clipboard' : 'Copy failed — long-press/select the text','ok');
 }
 
 /* ---- review ---- */
@@ -1850,6 +1876,7 @@ $('#applyPrefix').onclick=applyPrefix; $('#testShot').onclick=testShot;
 $('#autoExp').onclick=autoExpose;
 $('#checkUpd').onclick=checkUpdate;
 $('#diagBtn').onclick=showDiag; $('#logBtn').onclick=showLogs;
+$('#logRefresh').onclick=refreshOut; $('#copyOut').onclick=copyOut;
 $('#trigSave').onclick=saveTrigger; $('#trigRead').onclick=readSensor;
 $('#reshootSave').onclick=saveReshoot;
 $('#startCap').onclick=()=>setMode('capture');
