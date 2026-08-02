@@ -80,6 +80,24 @@ advancer = make_advancer(ADVANCE)
 TRIGGER = dict(TRIGGER_DEFAULTS)
 trigger = None
 
+# Auto-reshoot: after a capture, if the frame is flagged dark/over, step the
+# shutter one stop toward correct and reshoot the same frame (keeping the best),
+# then restore the baseline shutter. Fixes the odd dense slide in place during
+# an auto-run without pushing every following slide off. Default off.
+RESHOOT = {"enabled": False, "max": 1}
+
+
+def set_reshoot(cfg: dict) -> dict:
+    """Merge + clamp auto-reshoot settings."""
+    if "enabled" in cfg:
+        RESHOOT["enabled"] = bool(cfg["enabled"])
+    if "max" in cfg:
+        try:
+            RESHOOT["max"] = max(1, min(4, int(cfg["max"])))
+        except (TypeError, ValueError):
+            pass
+    return dict(RESHOOT)
+
 
 def set_advance(cfg: dict) -> dict:
     """Merge new advance settings and rebuild the advancer. Lock held.
@@ -395,12 +413,123 @@ def _grab(stem: str) -> tuple:
     return jpg, raw, derived
 
 
+_FLAGGED = ("dark", "under", "over", "bright")
+
+
+def _exp_score(stats: dict | None) -> float:
+    """Lower is better. Prefers 'ok', then a slight miss, then a clipped miss;
+    breaks ties by nearness to a good mid-brightness. Used to keep the best of
+    several reshoots so a correction never leaves a frame worse than the original."""
+    if not stats:
+        return 9e9
+    base = {"ok": 0, "dark": 2, "bright": 2, "under": 4, "over": 4}
+    return base.get(stats.get("status"), 3) * 1000 + abs((stats.get("mean") or 0) - 115)
+
+
+def _shutter_ladder() -> tuple[list[str], int | None]:
+    """(shutter labels sorted slow..fast by seconds, index of the current one).
+    index is None if the shutter isn't adjustable (dial not on M)."""
+    full = cam.get_config_full(["shutterspeed"]).get("shutterspeed", {})
+    ladder = sorted(((sec, c) for c in full.get("choices", [])
+                     if (sec := _shutter_seconds(c)) is not None),
+                    key=lambda x: x[0])
+    labels = [c for _, c in ladder]
+    current = full.get("current", "")
+    return labels, (labels.index(current) if current in labels else None)
+
+
+def _auto_reshoot(stem, jpg, raw, derived, stats):
+    """The first frame read dark/over: step the shutter toward correct and
+    reshoot the SAME frame up to RESHOOT['max'] times, keeping the best result,
+    then restore the baseline shutter. Reshoot captures go to temp stems and the
+    winner is promoted onto `stem`, so an overshoot never leaves it worse.
+    Returns (jpg, raw, derived, stats, tries). Assumes cam_lock held."""
+    prev = (cam.retries, cam.backoff)
+    cam.retries, cam.backoff = max(cam.retries, 6), max(cam.backoff, 1.2)
+    tries = []
+    best = {"jpg": jpg, "raw": raw, "derived": derived, "stats": stats,
+            "score": _exp_score(stats)}
+    try:
+        time.sleep(AUTOEXP_SETTLE_S)               # settle after the first capture
+        labels, idx = _shutter_ladder()
+        if idx is None or len(labels) < 2:
+            return jpg, raw, derived, stats, tries
+        orig_idx, cur = idx, idx
+        for k in range(RESHOOT.get("max", 1)):
+            st = (best["stats"] or {}).get("status")
+            if st in ("dark", "under"):
+                nxt = cur + 1                      # longer -> brighter
+            elif st in ("over", "bright"):
+                nxt = cur - 1                      # shorter -> darker
+            else:
+                break                              # 'ok' or unknown -> done
+            if not (0 <= nxt < len(labels)):
+                break                              # at an edge of the ladder
+            cur = nxt
+            cam.configure({"shutterspeed": labels[cur]})
+            time.sleep(AUTOEXP_SETTLE_S)
+            tstem = f"_reshoot{k}"
+            tj, tr, td = _grab(tstem)
+            ts = jpegstats.luma_stats(tj)
+            tries.append({"shutter": labels[cur], "status": (ts or {}).get("status"),
+                          "mean": (ts or {}).get("mean")})
+            sc = _exp_score(ts)
+            if sc < best["score"]:
+                best = {"jpg": tj, "raw": tr, "derived": td, "stats": ts, "score": sc}
+            if (ts or {}).get("status") == "ok":
+                break
+        if cur != orig_idx:                        # restore baseline for next slide
+            cam.configure({"shutterspeed": labels[orig_idx]})
+    finally:
+        cam.retries, cam.backoff = prev
+    # Promote the winner onto the real stem (if a reshoot won) and clear temps.
+    if best["jpg"] is not None and best["jpg"].stem != stem:
+        pj, pr, pd = _promote_reshoot(best["jpg"].stem, stem, best["derived"])
+        best["jpg"], best["raw"], best["derived"] = pj, pr, pd
+    _cleanup_reshoot()
+    return best["jpg"], best["raw"], best["derived"], best["stats"], tries
+
+
+def _promote_reshoot(tmp_stem: str, stem: str, derived: bool):
+    """Replace stem.* with the winning tmp_stem.* files. Returns (jpg, raw, derived)."""
+    for f in list(OUT_DIR.glob(f"{stem}.*")):      # remove the losing originals
+        if f.stem == stem:
+            try:
+                f.unlink()
+            except OSError:
+                pass
+    jpg = raw = None
+    for f in sorted(OUT_DIR.glob(f"{tmp_stem}.*")):
+        if f.stem != tmp_stem:
+            continue
+        dest = OUT_DIR / (stem + f.suffix)
+        try:
+            f.replace(dest)
+        except OSError:
+            continue
+        ext = dest.suffix.lower()
+        if ext in IMAGE_EXTS:
+            jpg = dest
+        elif ext in RAW_EXTS:
+            raw = dest
+    return jpg, raw, derived
+
+
+def _cleanup_reshoot() -> None:
+    _wipe("_reshoot*.*")
+
+
 def do_capture() -> dict:
     """Capture one frame into the current group. Assumes cam_lock held."""
     prefix, n = PREFIX, next_index(PREFIX)
-    jpg, raw, derived = _grab(f"{prefix}_{n:04d}")
-    write_metadata(jpg, raw)
+    stem = f"{prefix}_{n:04d}"
+    jpg, raw, derived = _grab(stem)
     stats = jpegstats.luma_stats(jpg)
+    reshoots = []
+    if RESHOOT["enabled"] and stats and stats.get("status") in _FLAGGED:
+        jpg, raw, derived, stats, reshoots = _auto_reshoot(
+            stem, jpg, raw, derived, stats)
+    write_metadata(jpg, raw)
     if stats:                                      # cache verdict for Review
         ex = load_exposure()
         ex[jpg.name] = stats.get("status")
@@ -411,7 +540,7 @@ def do_capture() -> dict:
         else None
     return {"ok": True, "name": jpg.name, "index": n, "count": image_count(prefix),
             "raw": raw.name if raw else None, "preview_from_raw": derived,
-            "exposure": stats, "advance": adv}
+            "exposure": stats, "advance": adv, "reshoots": reshoots}
 
 
 def do_advance() -> dict:
@@ -512,7 +641,8 @@ def read_status() -> dict:
     except CameraError as e:
         return {"connected": False, "error": friendly(str(e)), "prefix": PREFIX,
                 "count": image_count(PREFIX), "recent": recent_images(PREFIX),
-                "captions": load_captions(), "exposure": load_exposure()}
+                "captions": load_captions(), "exposure": load_exposure(),
+                "reshoot": dict(RESHOOT)}
     mode = v.get("autoexposuremode", "?")
     return {
         "connected": True, "model": model,
@@ -522,7 +652,7 @@ def read_status() -> dict:
         "shutter": v.get("shutterspeed", "?"), "format": v.get("imageformat", "?"),
         "prefix": PREFIX, "count": image_count(PREFIX),
         "recent": recent_images(PREFIX), "captions": load_captions(),
-        "exposure": load_exposure(),
+        "exposure": load_exposure(), "reshoot": dict(RESHOOT),
     }
 
 
@@ -707,7 +837,7 @@ def read_diag() -> dict:
          "platform": platform.platform(), "out_dir": str(OUT_DIR.resolve()),
          "prefix": PREFIX, "have_exiftool": HAVE_EXIFTOOL,
          "advance_mode": ADVANCE.get("mode"),
-         "trigger": public_trigger()}
+         "trigger": public_trigger(), "reshoot": dict(RESHOOT)}
     try:
         d["gphoto2"] = (subprocess.run(["gphoto2", "--version"],
                         capture_output=True, text=True, timeout=10)
@@ -888,6 +1018,10 @@ class Handler(BaseHTTPRequestHandler):
             except TriggerError as e:
                 self._json({"ok": False, "error": str(e),
                             "trigger": public_trigger()}, 400)
+        elif path == "/api/reshoot":
+            self._json({"ok": True, "reshoot": set_reshoot(self._body())})
+        elif path == "/api/deleteall":
+            self._delete_all(self._body().get("prefix", ""))
         elif path == "/api/debugcapture":
             self._with_camera(debug_capture, wait=15)   # diagnostic (alpha)
         elif path == "/api/update":
@@ -957,6 +1091,31 @@ class Handler(BaseHTTPRequestHandler):
                 save_exposure(ex)
         self._json({"ok": bool(removed), "removed": removed,
                     "count": image_count(PREFIX), "recent": recent_images(PREFIX)})
+
+    def _delete_all(self, prefix: str):
+        """Delete every image in the CURRENT group (+ RAW siblings) and clear its
+        caption/exposure caches. Guarded: the client must echo the current prefix
+        so a stale tab can't wipe a group it isn't looking at."""
+        if sanitize_prefix(prefix) != PREFIX:
+            return self._json({"ok": False, "error": "prefix mismatch — reload "
+                               "and try again"}, 409)
+        removed = []
+        for img in group_images(PREFIX):
+            for sib in OUT_DIR.glob(img.stem + ".*"):   # jpg + cr2 sibling
+                try:
+                    sib.unlink()
+                    removed.append(sib.name)
+                except OSError:
+                    pass
+        if removed:                                # reset the sidecar caches
+            caps = load_captions()
+            if any(caps.pop(r, None) is not None for r in removed):
+                save_captions(caps)
+            ex = load_exposure()
+            if any(ex.pop(r, None) is not None for r in removed):
+                save_exposure(ex)
+        self._json({"ok": True, "removed": len(removed),
+                    "count": image_count(PREFIX)})
 
     def _caption(self, body: dict):
         name = body.get("name", "")
@@ -1233,6 +1392,15 @@ INDEX_HTML = r"""<!doctype html>
         </div>
         <div class="note" id="trigMsg">Wire OUT→GPIO24 (pin 18), VCC→3V3 (pin 1), GND→pin 6.
           Not sure of the polarity? Block the beam and hit “Read sensor now”.</div>
+        <hr style="border:none;border-top:1px solid #ffffff18;margin:.8rem 0">
+        <label class="tog"><input type="checkbox" id="reshootOn">Auto-reshoot dark/bright frames in place</label>
+        <div class="grid2" style="margin-top:.5rem">
+          <div><label>Max reshoots per frame</label><input id="reshootMax" type="number" min="1" max="4" value="1"></div>
+        </div>
+        <div class="diagrow" style="margin-top:.5rem"><button id="reshootSave">Save</button></div>
+        <div class="note">After each shot, if it reads dark/bright the shutter steps toward correct and the
+          <em>same</em> frame is reshot (keeping the best), then the baseline shutter is restored. Each reshoot
+          adds a few seconds — leave enough gap before the next slide arrives.</div>
       </div>
      </div>
     </div>
@@ -1263,6 +1431,7 @@ INDEX_HTML = r"""<!doctype html>
       <label class="tog"><input type="checkbox" id="flagOnly">Only flagged</label>
       <button id="revRefresh">↻ Refresh</button>
       <button id="revZip">⬇ Download all (zip)</button>
+      <button id="revDelAll" class="del">🗑 Delete all</button>
     </div>
     <div id="gridwrap">
       <div id="grid"></div>
@@ -1324,6 +1493,10 @@ async function status(){
   if(s.busy) return;
   ST.prefix=s.prefix||'slide'; ST.count=s.count||0;
   ST.recent=s.recent||[]; ST.captions=s.captions||{}; ST.exposure=s.exposure||{};
+  if(s.reshoot){
+    if(document.activeElement!==$('#reshootOn')) $('#reshootOn').checked=!!s.reshoot.enabled;
+    if(document.activeElement!==$('#reshootMax')) $('#reshootMax').value=s.reshoot.max||1;
+  }
   $('#pfxEx').textContent=ST.prefix; if(!$('#prefix').value) $('#prefix').value=ST.prefix;
   $('#grpcount').textContent=ST.prefix+' · '+ST.count;
   if(!s.connected){ $('#camstat').textContent=s.error?'no camera':'no camera'; $('#camstat').className='pill bad';
@@ -1354,7 +1527,8 @@ async function capture(){
     const d=await jpost('/api/capture');
     if(d.ok){ ST.count=d.count; ST.recent.unshift(d.name); if(d.exposure) ST.exposure[d.name]=d.exposure.status;
       capIdx=0; $('#grpcount').textContent=ST.prefix+' · '+ST.count; renderCap();
-      $('#capMsg').textContent='Saved '+d.name; $('#capMsg').className='ok'; }
+      const rs=(d.reshoots&&d.reshoots.length)?' (reshot ×'+d.reshoots.length+')':'';
+      $('#capMsg').textContent='Saved '+d.name+rs; $('#capMsg').className='ok'; }
     else { $('#capMsg').textContent=d.error||'capture failed'; $('#capMsg').className='err'; toast(d.error||'capture failed','err'); beep(); }
   }catch(e){ $('#capMsg').textContent='network error'; $('#capMsg').className='err'; beep(); }
   finally{ busy=false; $('#spinner').style.display='none'; $('#shoot').disabled=false; }
@@ -1480,6 +1654,13 @@ async function readSensor(){
     + (d.obstructed?'OBSTRUCTED':'clear')
     + ' (with the current polarity). Block/clear the beam and read again to confirm.';
 }
+async function saveReshoot(){
+  const d=await jpost('/api/reshoot',{enabled:$('#reshootOn').checked,
+    max:parseInt($('#reshootMax').value,10)||1});
+  if(d.ok){ $('#reshootOn').checked=d.reshoot.enabled; $('#reshootMax').value=d.reshoot.max;
+    toast(d.reshoot.enabled?'Auto-reshoot on (max '+d.reshoot.max+')':'Auto-reshoot off','ok'); }
+  else toast('save failed','err');
+}
 
 /* ---- diagnostics ---- */
 async function showDiag(){
@@ -1517,6 +1698,13 @@ async function syncReview(){
   if(d.total===rev.total && revSig(d.items)===rev._sig) return;   // nothing changed
   rev.items=d.items; rev.total=d.total; rev.offset=rev.items.length; rev._sig=revSig(rev.items);
   renderGrid();
+}
+async function deleteAll(){
+  if(!rev.total){ toast('Nothing to delete','ok'); return; }
+  if(!confirm('Delete ALL '+rev.total+' image'+(rev.total===1?'':'s')+' in “'+ST.prefix+'”?\nThis cannot be undone — download first if you want to keep them.')) return;
+  const d=await jpost('/api/deleteall',{prefix:ST.prefix});
+  if(d.ok){ toast('Deleted '+d.removed+' file'+(d.removed===1?'':'s'),'ok'); ST.count=d.count; loadReview(true); }
+  else toast(d.error||'delete failed','err');
 }
 function visibleItems(){ return $('#flagOnly').checked ? rev.items.filter(i=>FLAG[i.exposure]) : rev.items; }
 function renderGrid(){
@@ -1560,10 +1748,12 @@ $('#autoExp').onclick=autoExpose;
 $('#checkUpd').onclick=checkUpdate;
 $('#diagBtn').onclick=showDiag; $('#logBtn').onclick=showLogs;
 $('#trigSave').onclick=saveTrigger; $('#trigRead').onclick=readSensor;
+$('#reshootSave').onclick=saveReshoot;
 $('#startCap').onclick=()=>setMode('capture');
 $('#shoot').onclick=capture; $('#redo').onclick=redoLast;
 $('#revRefresh').onclick=()=>loadReview(true); $('#flagOnly').onchange=renderGrid;
 $('#revZip').onclick=()=>location.href='/api/zip'; $('#loadMore').onclick=()=>loadReview(false);
+$('#revDelAll').onclick=deleteAll;
 $('#lbNavL').onclick=()=>lbNav(-1); $('#lbNavR').onclick=()=>lbNav(1);
 $('#lbClose').onclick=closeLB; $('#lbDel').onclick=lbDelete; $('#lbSave').onclick=lbSave;
 $('#lbDl').onclick=()=>{ const it=rev.items[rev.lbIdx]; if(it) location.href='/media/'+encodeURIComponent(it.name)+'?dl=1'; };

@@ -178,6 +178,14 @@ Files (all in repo root, stdlib only):
     exposure; returns exposure stats
   - `POST /api/advance` — manually advance one slide (test button; no-op error
     when auto-advance mode is `off`)
+  - `GET /api/trigger` — optical-sensor config + live level (for polarity);
+    `POST /api/trigger` — apply sensor-trigger config (`mode`/`active_high`/…)
+  - `POST /api/reshoot` — set auto-reshoot (`enabled`/`max`): after a capture,
+    if the frame is flagged dark/over, step the shutter toward correct and
+    reshoot the SAME frame (keeping the best of ≤`max` tries), then restore the
+    baseline shutter. Fixes the odd dense slide in place during an auto-run
+    without drifting the rest. Reshoot captures go to temp stems, the winner is
+    promoted onto the frame, so an overshoot never leaves it worse. Default off.
   - `GET /api/version` — current app version (`git describe`)
   - `GET /api/update` — check origin for a newer release tag; `POST /api/update`
     — check out the latest tag + restart the service (in-app self-update; git +
@@ -191,6 +199,9 @@ Files (all in repo root, stdlib only):
   - `POST /api/preset` — apply a quick preset (`slides` | `negatives`)
   - `POST /api/caption` — set/clear a per-image caption
   - `POST /api/delete` — delete an image and its RAW sibling (name-guarded)
+  - `POST /api/deleteall` — delete the whole current group + RAW siblings and
+    clear its caption/exposure caches (prefix-guarded so a stale tab can't wipe
+    the wrong group); Review "Delete all" button, for clearing after download
   - `GET /media/<file>` (path-traversal guarded; `?dl=1` forces download)
   - `GET /thumb/<file>` — tiny embedded EXIF thumbnail (fast Review grid)
   - `GET /api/images?offset=&limit=` — paginated group listing (name, caption,
@@ -250,7 +261,10 @@ UI — three modes (built for high-volume, keyboard-first; see the redesign plan
   beep+toast on failure; updates from the capture response (no status round-trip)
   so the loop stays snappy.
 - **Review** (after): thumbnail grid via `/thumb` + `/api/images`, "only
-  flagged" filter, lightbox to caption/delete/download, download-all zip.
+  flagged" filter, lightbox to caption/delete/download, download-all zip, and
+  **Delete all** (clear the group after downloading). The grid **auto-syncs**
+  every 4s while active + on tab focus (reflects an ongoing auto-run's new
+  frames and deletes from any device); paused while the lightbox is open.
 - Nav: `[` Setup, `]` Review; typing in inputs suppresses shortcuts.
 
 Features:
