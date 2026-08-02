@@ -91,6 +91,43 @@ value dialed in per session against your light pad using the Test shot +
 exposure aid. Focus once, manually, on the film plane. Full rationale in
 [CLAUDE.md](CLAUDE.md).
 
+## Optical sensor trigger (optional)
+
+Instead of pressing Capture, you can wire a 3-pin optical sensor (IR break-beam
+or photo-interrupter) so a slide dropping into position fires the shot
+automatically (`trigger.py`, off by default). It pairs with auto slide-advance:
+advance → beam blocked → capture → repeat.
+
+### Wiring — Raspberry Pi 40-pin header
+
+| Sensor wire | Connect to | Physical pin |
+|-------------|------------|--------------|
+| **VCC** | **3V3** | **1** |
+| **GND** | **Ground** | **6** |
+| **OUT** | **GPIO24** | **18** |
+
+⚠️ **Power the sensor from 3V3 (pin 1), not 5V.** The Pi's GPIO is **3.3V-only
+and not 5V-tolerant** — a 5V-powered sensor can swing OUT to 5V and damage the
+input. Most IR/photo-interrupter modules run fine at 3.3V. Only if yours
+*requires* 5V (pins 2/4) do you power it there, and then you **must** drop OUT to
+3.3V (voltage divider or level shifter) before pin 18. GPIO24 is used because it
+avoids the pins `advance.py` reserves (BCM 17/18/22/27).
+
+### Enabling + polarity
+
+Sensor OUT idle state varies part-to-part, so the trigger polarity is a setting.
+In **Setup → Sensor trigger**: tick *Auto-capture when the beam is blocked*, pick
+whether OUT goes **LOW** (active-low, the typical open-collector case — default)
+or **HIGH** when blocked, set the GPIO line, and **Save**. Not sure which?
+**Block the beam and hit “Read sensor now”** — it reads the raw 0/1 so you can
+tell active-low (obstructed = 0) from active-high (obstructed = 1). A short
+cooldown debounces bounce and avoids a double-fire during the download.
+
+CLI equivalents: `--sensor`, `--sensor-line N` (BCM, default 24),
+`--sensor-active-high`. Needs `gpiod` (`sudo apt install gpiod`; already in the
+appliance image). Sensor captures share the camera lock with the UI, so a sensor
+shot and a button press never overlap.
+
 ## Files
 
 | File | Role |
@@ -136,4 +173,6 @@ correction.
       `slidescanner.local` QR-code bookmark hides the `:8080`.
 - [ ] Auto slide-advance (`advance.py`): stub + API done; needs hardware
       bring-up (motor + stop-switch or stepper) and a UI toggle in Setup
+- [ ] Optical-sensor capture trigger (`trigger.py`): module + API + Setup UI
+      done (configurable polarity, `gpiod` in the image); needs hardware bring-up
 - [ ] Automated XY gantry (GRBL) for hands-free batch scanning (`scanner.py`)
