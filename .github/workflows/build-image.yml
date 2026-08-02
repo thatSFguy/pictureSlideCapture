@@ -30,10 +30,12 @@ jobs:
         id: build
         uses: pguyot/arm-runner-action@v2
         with:
-          # 32-bit (armhf) so the image boots on ARMv6 (Pi Zero W / Pi 1) as
-          # well as the ARMv8 Zero 2 W. The workload is USB-bound, so 64-bit
-          # buys nothing here; one image covers every target board.
-          base_image: raspios_lite:latest
+          # 64-bit (arm64). Minimum supported board is now 64-bit-capable
+          # (Pi Zero 2 W and up); the single-core ARMv6 Zero W / Pi 1 are no
+          # longer targets. The per-shot cycle is partly CPU-bound (Python +
+          # exiftool), which the quad-core A53 handles far better than the old
+          # ARMv6 board.
+          base_image: raspios_lite_arm64:latest
           image_additional_mb: 1024
           copy_repository_path: /opt/slidescanner
           commands: |
@@ -43,7 +45,7 @@ jobs:
         run: |
           IMG="${{ steps.build.outputs.image }}"
           xz -T0 -6 "$IMG"
-          NAME="slidescanner-${{ github.ref_name }}-armhf.img.xz"
+          NAME="slidescanner-${{ github.ref_name }}-arm64.img.xz"
           mv "${IMG}.xz" "$NAME"
           echo "ASSET=$NAME" >> "$GITHUB_ENV"
           ls -lh "$NAME"

@@ -2,7 +2,7 @@
 
 > ## ⚠️ Alpha
 > Early and under active development. It works end-to-end on the author's setup
-> (Canon EOS 400D on a Raspberry Pi Zero W), but it's been tested on exactly one
+> (Canon EOS 400D on a Raspberry Pi Zero 2 W), but it's been tested on exactly one
 > camera and rig, has **no authentication** (designed for a trusted home LAN),
 > and interfaces may change. Use at your own risk; expect rough edges.
 
@@ -51,8 +51,11 @@ WiFi AP → enter your network → it reconnects → scan at
 
 Prebuilt appliance images are attached to
 [Releases](https://github.com/thatSFguy/pictureSlideCapture/releases) — flash the
-latest `slidescanner-*-armhf.img.xz` with Raspberry Pi Imager (32-bit, boots
-both the Pi Zero W and Zero 2 W).
+latest `slidescanner-*-arm64.img.xz` with Raspberry Pi Imager.
+
+> **Minimum board: a 64-bit-capable Pi (Pi Zero 2 W or newer).** The image is
+> **64-bit (arm64)**, so the single-core ARMv6 Pi Zero W / Pi 1 are no longer
+> supported. The Zero 2 W is the reference target.
 
 ### Updating
 

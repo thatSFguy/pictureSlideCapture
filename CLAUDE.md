@@ -225,6 +225,19 @@ Files (all in repo root, stdlib only):
   calls it after each capture when enabled (`after_capture`); a failed advance
   is reported in the response, never fatal (image is already saved). Motor path
   is written but UNTESTED on hardware — first run is a bring-up.
+  **Motor drive pin — reserved GPIO10 (phys pin 19).** For a low-side N-channel
+  MOSFET gate (set `motor_line=10`, keep `motor_active_high=true`). Chosen
+  because: (1) it's free — GPIO10 is SPI0 MOSI but SPI is disabled on the
+  appliance; (2) **boot-safe** — GPIO9–27 default to an internal *pull-down*, so
+  the gate sits LOW (motor OFF) at power-up (GPIO0–8 pull *up* — avoid those for
+  a motor); (3) physically next to the sensor pins (18/GPIO24) with GND on pin
+  20, so it's one extra solder joint near the ones already needed. Still add a
+  hardware ~10k gate→GND (the internal pull is weak and only after SoC config),
+  ~100–220Ω gate series, a flyback diode across the motor, and power the motor
+  from its own supply with ground common to the Pi. NOTE: the motor advance is
+  **switch-based** (runs until `switch_line`, default GPIO27, trips) — with only
+  the drive pin and no index switch it just runs to `timeout_s`; a purely timed
+  run mode is not implemented.
 - `gpiocli.py` — version-aware libgpiod CLI argv builders (`get_cmd`/`mon_cmd`/
   `set_hold_cmd`/`parse_level`). **libgpiod v1 and v2 have incompatible syntax**
   (v2, on recent Pi OS: `gpioget -c <chip> <line>`, `gpiomon -e rising -c …`; v1:

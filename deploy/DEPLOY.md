@@ -1,8 +1,10 @@
-# Deploying on a Raspberry Pi Zero W / Zero 2 W
+# Deploying on a Raspberry Pi Zero 2 W
 
-> The CI image is **32-bit (armhf)** so it boots on both the single-core Zero W
-> (ARMv6) and the quad-core Zero 2 W (ARMv8). The Zero 2 W is snappier, but the
-> workload is bound by the camera's ~1.7 MB/s USB transfer, so either works.
+> The CI image is **64-bit (arm64)**. **Minimum board: a 64-bit-capable Pi
+> (Zero 2 W or newer)** — the single-core ARMv6 Zero W / Pi 1 are no longer
+> supported. The per-shot cycle is partly CPU-bound (Python + exiftool), which
+> the Zero 2 W's quad-core A53 handles far better than the old ARMv6 board; the
+> rest is bound by the camera's ~1.7 MB/s USB transfer.
 
 Goal — the appliance flow:
 
@@ -18,9 +20,10 @@ Comitup/gphoto2 without a network. So this is **two phases**:
 - **Part B — flash that image and go.** This is the zero-config flow above, and
   it's what you (or anyone) do from then on.
 
-> Why the Zero 2 W is fine: the bottleneck is the camera's ~1.7 MB/s USB
-> transfer, not the Pi. The app is stdlib-only Python. The zip download streams
-> and thumbnails read only the file head, so 512 MB RAM is enough.
+> Why the Zero 2 W's 512 MB RAM is enough: the app is stdlib-only Python, the
+> zip download streams, and thumbnails read only the file head. (arm64 uses a
+> little more RAM than 32-bit, but the app's footprint is small.) Part of the
+> per-shot time is the camera's ~1.7 MB/s USB transfer, which no board fixes.
 
 ## Getting the appliance image
 
@@ -53,8 +56,8 @@ You need a network *for this build only*. It won't be needed on the finished
 image.
 
 1. **Flash a build card.** Raspberry Pi Imager → *Raspberry Pi OS Lite
-   (**32-bit**, Bookworm)* — 32-bit boots on every board (Zero W / Zero 2 W /
-   Pi 1+), which matches the CI image. In OS customisation set: hostname
+   (**64-bit**, Bookworm)* — matches the CI image; requires a 64-bit-capable
+   board (Zero 2 W or newer). In OS customisation set: hostname
    `slidescanner`, a username + password, enable **SSH**, and **your WiFi**
    (temporary — for the build).
 
