@@ -24,11 +24,26 @@ Like advance.py, GPIO is driven by shelling out to libgpiod (`gpiomon` /
 `gpioget`) — the same subprocess-to-CLI pattern the project uses for gphoto2, so
 there's no pip dependency (`apt install gpiod`). Command syntax differs between
 libgpiod v1 and v2 (recent Raspberry Pi OS ships v2), so the argv is built by
-`gpiocli`, which auto-detects the version. The watcher runs in a daemon
-thread reading one long-lived `gpiomon` (so no edges are missed between polls);
-each detected edge calls the capture callback, which the server serializes
-behind the same camera lock as the web UI, so a sensor trigger and a button
-press can never overlap.
+`gpiocli`, which auto-detects the version.
+
+Two daemon threads cooperate so a slide dropped *while the previous capture is
+still running* isn't lost (captures take many seconds on the Pi):
+
+  - a **reader** thread streams edges from one long-lived `gpiomon` in real time
+    (never blocked by a capture) and, for each debounced edge, sets a single
+    "capture requested" flag;
+  - a **worker** thread performs captures one at a time. An edge that arrives
+    during a capture leaves the flag set, so the worker fires again the moment
+    it's free instead of the edge being discarded. The flag is coalesced, so a
+    burst of edges (contact bounce, or the camera's own USB re-enumeration noise
+    during a capture) collapses to at most one pending capture.
+
+To avoid re-firing on that re-enumeration noise, a *queued* capture (one
+requested while a capture was already running) is taken only if the beam still
+reads obstructed — i.e. a slide is actually seated (`verify`). The first,
+immediate edge is trusted, so the single-slide path behaves as before. The
+capture callback is serialized by the server behind the same camera lock as the
+web UI, so a sensor trigger and a button press can never overlap.
 
 Nothing here runs unless `mode` is "gpio" in settings, so importing/using this
 module with the default config is a safe no-op (and needs no GPIO hardware).
@@ -53,10 +68,23 @@ TRIGGER_DEFAULTS = {
     "bias": "pull-up",        # internal bias: pull-up|pull-down|disable|as-is
                               # (pull-up gives an open-collector sensor a defined
                               #  idle HIGH; use as-is for a push-pull output)
-    "cooldown_s": 1.5,        # ignore new edges this long after one fires
-                              # (software debounce + no double-fire during the
-                              #  capture's own download)
+    "cooldown_s": 1.5,        # contact-bounce debounce on the reader (capped low
+                              #  internally — see _BOUNCE_MAX). No longer gates
+                              #  real slides: the queue+verify model below keeps a
+                              #  slide dropped mid-capture from being lost.
+    "verify": True,           # before taking a capture that was QUEUED during a
+                              #  previous one, confirm the beam still reads
+                              #  obstructed (a slide is seated). Rejects the
+                              #  camera's USB re-enumeration noise edge without
+                              #  dropping real slides. Off -> take queued shots
+                              #  unconditionally (may double-fire on noise).
 }
+
+# Reader-side contact-bounce debounce ceiling (seconds). The reader coalesces
+# edges into a single pending request, so a *long* debounce here would drop a
+# genuine next-slide edge that lands soon after the previous one; real electrical
+# bounce is sub-millisecond, so a few hundred ms is plenty.
+_BOUNCE_MAX = 0.5
 
 
 class TriggerError(Exception):
@@ -105,8 +133,8 @@ def _log_print(msg) -> None:
 
 class SensorTrigger:
     """Background watcher that fires `on_trigger` on the sensor's
-    unobstructed->obstructed edge. No-op (never starts a thread) unless
-    mode == 'gpio'."""
+    unobstructed->obstructed edge. No-op (never starts threads) unless
+    mode == 'gpio'. See the module docstring for the reader/worker split."""
 
     def __init__(self, settings: dict, on_trigger, log=_log_print):
         self._on_trigger = on_trigger
@@ -119,12 +147,16 @@ class SensorTrigger:
         except (TypeError, ValueError) as e:
             raise TriggerError(f"bad trigger config: {e}")
         self.active_high = bool(_cfg(settings, "active_high"))
+        self.verify = bool(_cfg(settings, "verify"))
         # unobstructed -> obstructed is a rising edge if obstructed reads HIGH,
         # else a falling edge.
         self.edge = "rising" if self.active_high else "falling"
         self.bias = str(_cfg(settings, "bias"))
+        self._bounce = min(self.cooldown, _BOUNCE_MAX)
         self._stop = threading.Event()
-        self._thread: threading.Thread | None = None
+        self._req = threading.Event()      # a capture is requested (coalesced)
+        self._reader: threading.Thread | None = None
+        self._worker: threading.Thread | None = None
         self._proc: subprocess.Popen | None = None
 
     @property
@@ -144,18 +176,22 @@ class SensorTrigger:
             return
         if shutil.which("gpiomon") is None:
             raise TriggerError("gpiomon not found — run `sudo apt install gpiod`")
-        self._thread = threading.Thread(target=self._run, name="sensor-trigger",
+        self._stop.clear()
+        self._worker = threading.Thread(target=self._serve, name="sensor-capture",
                                         daemon=True)
-        self._thread.start()
+        self._worker.start()
+        self._reader = threading.Thread(target=self._watch, name="sensor-watch",
+                                        daemon=True)
+        self._reader.start()
         self._log(f"[trigger] watching {self.describe()}")
 
-    def _run(self) -> None:
-        # ONE long-lived gpiomon that streams every edge — so an edge that lands
-        # DURING a capture is still seen (it buffers, we process it right after)
-        # instead of being missed. To keep it prompt (a plain streaming pipe gets
-        # block-buffered by libc + Python read-ahead, which lagged edges by
-        # seconds), force line-buffered output with `stdbuf -oL` and read with
-        # readline() (no read-ahead).
+    # -- reader: stream edges in real time, request captures ----------------
+    def _watch(self) -> None:
+        # ONE long-lived gpiomon streaming every edge, read in REAL TIME — the
+        # capture runs on the worker thread, so this loop is never blocked and an
+        # edge that lands DURING a capture is still seen and queued (not missed).
+        # Force line-buffered output with `stdbuf -oL` + readline() so edges
+        # aren't lagged by libc / Python read-ahead buffering.
         args = gpiocli.with_sudo(
             gpiocli.mon_cmd(self.chip, self.line, self.edge, self.bias),
             self.chip, self.line, self.bias)
@@ -178,17 +214,11 @@ class SensorTrigger:
                     break
                 fails = 0
                 now = time.monotonic()
-                if now - last < self.cooldown:         # debounce / bounce
-                    self._log(f"[trigger] edge ignored (within {self.cooldown:g}s "
-                              "cooldown)")
+                if now - last < self._bounce:          # contact-bounce debounce
                     continue
                 last = now
-                self._log("[trigger] edge detected -> capturing")
-                try:
-                    self._on_trigger()
-                except Exception as e:                 # never kill the watcher
-                    self._log(f"[trigger] capture callback error: {e}")
-                last = time.monotonic()                # re-arm cooldown post-capture
+                self._log("[trigger] edge -> capture requested")
+                self._req.set()                        # coalesced: at most 1 pending
             err = ""
             try:
                 err = (self._proc.stderr.read() or "").strip()
@@ -207,6 +237,56 @@ class SensorTrigger:
                       "restarting in 1s")
             self._stop.wait(1.0)
 
+    # -- worker: capture one slide at a time --------------------------------
+    def _serve(self) -> None:
+        while not self._stop.is_set():
+            if not self._req.wait(0.2):                # nothing pending
+                continue
+            if self._stop.is_set():
+                break
+            self._req.clear()
+            self._log("[trigger] edge detected -> capturing")
+            self._fire()
+            # A slide dropped WHILE that capture ran left _req set. Fire again —
+            # but only if the beam still reads obstructed, so a transient (the
+            # camera's re-enumeration noise, or a slide already pulled back out)
+            # doesn't shoot an empty frame.
+            while self._req.is_set() and not self._stop.is_set():
+                self._req.clear()
+                seated = self._seated()
+                if seated is False:
+                    self._log("[trigger] queued edge but beam now clear — skipping")
+                    break
+                if seated is None:
+                    self._log("[trigger] queued edge; sensor read failed — skipping")
+                    break
+                self._log("[trigger] queued slide still seated -> capturing")
+                self._fire()
+
+    def _fire(self) -> None:
+        try:
+            self._on_trigger()
+        except Exception as e:                         # never kill the worker
+            self._log(f"[trigger] capture callback error: {e}")
+
+    def _seated(self):
+        """For a QUEUED capture: True if the beam currently reads obstructed
+        (a slide is seated), False if clear, None if the level couldn't be read.
+        Always True when `verify` is off (take queued shots unconditionally)."""
+        if not self.verify:
+            return True
+        args = gpiocli.with_sudo(gpiocli.get_cmd(self.chip, self.line, self.bias),
+                                 self.chip, self.line, self.bias)
+        try:
+            r = subprocess.run(args, capture_output=True, text=True, timeout=5)
+            if r.returncode != 0:
+                return None
+            lvl = gpiocli.parse_level(r.stdout)
+        except (OSError, subprocess.TimeoutExpired, ValueError):
+            return None
+        obstructed = 1 if self.active_high else 0
+        return lvl == obstructed
+
     @staticmethod
     def _line_buffered(args: list[str]) -> list[str]:
         """Prepend `stdbuf -oL` to the gpiomon program so each edge line is
@@ -221,13 +301,15 @@ class SensorTrigger:
 
     def stop(self) -> None:
         self._stop.set()
+        self._req.set()                    # wake the worker so it exits promptly
         if self._proc and self._proc.poll() is None:
             try:
                 self._proc.terminate()
             except Exception:
                 pass
-        if self._thread:
-            self._thread.join(timeout=3)
+        for t in (self._reader, self._worker):
+            if t:
+                t.join(timeout=3)
 
 
 def make_trigger(settings: dict, on_trigger, log=_log_print) -> SensorTrigger:

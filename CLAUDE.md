@@ -233,19 +233,30 @@ Files (all in repo root, stdlib only):
   name). `major()` detects the version once; `trigger.py` + `advance.py` use it
   so both work on either. Reads parse v1 (`0`/`1`) and v2 (`24=inactive`).
 - `trigger.py` — optical-sensor capture trigger (settings-driven, default
-  `off`). A background daemon thread reads one long-lived `gpiomon` (libgpiod
-  via subprocess through `gpiocli`, same pattern as advance.py — needs `apt
-  install gpiod`, now in the appliance image) and fires a capture on the
-  **unobstructed→obstructed**
-  edge. **Polarity is configurable** because sensor OUT idle state varies:
-  `active_high=False` (default) treats obstructed as LOW → **falling** edge;
-  `active_high=True` → **rising** edge. `bias` sets an internal pull-up (default,
-  gives an open-collector sensor a defined idle) / pull-down / disable.
-  `cooldown_s` debounces + prevents a double-fire during the capture's own
-  download. `read_level()` (`gpioget`) reads the raw 0/1 so polarity can be
-  discovered by blocking the beam. The trigger callback (`sensor_capture`) is
-  serialized behind the same `cam_lock`, so a sensor shot and a button press
-  never overlap; if the camera is busy the trigger is skipped, not queued.
+  `off`). **Two daemon threads** (libgpiod via subprocess through `gpiocli`, same
+  pattern as advance.py — needs `apt install gpiod`, now in the appliance image):
+  a **reader** streams edges from one long-lived `gpiomon` in real time and, for
+  each debounced edge, sets a single coalesced "capture requested" flag; a
+  **worker** performs captures one at a time on the **unobstructed→obstructed**
+  edge. This split is the fix for *"the sensor sometimes doesn't fire"*: a slide
+  dropped **while the previous ~18s capture is still running** used to be
+  buffered then discarded by the post-capture cooldown; now it leaves the flag
+  set and the worker fires again the moment it's free (edges are no longer lost
+  to a busy capture). **Polarity is configurable** because sensor OUT idle state
+  varies: `active_high=False` (default) treats obstructed as LOW → **falling**
+  edge; `active_high=True` → **rising** edge. `bias` sets an internal pull-up
+  (default, gives an open-collector sensor a defined idle) / pull-down / disable.
+  `cooldown_s` is now only a short reader-side contact-bounce debounce (capped at
+  `_BOUNCE_MAX`=0.5s so it can't drop a real next-slide edge). A capture that was
+  **queued** during a previous one is taken only if `verify` (default on) reads
+  the beam still obstructed via `gpioget` — so the 400D's USB re-enumeration
+  noise edge (the one discarded after every capture in the old logs) doesn't
+  shoot an empty frame, while a genuinely seated slide still fires. Set
+  `verify=false` to take queued shots unconditionally. `read_level()` (`gpioget`)
+  reads the raw 0/1 so polarity can be discovered by blocking the beam. The
+  trigger callback (`sensor_capture`) is serialized behind the same `cam_lock`,
+  so a sensor shot and a button press never overlap; if the camera is busy the
+  trigger is skipped, not queued.
   Wiring (Pi 40-pin): **OUT→GPIO24 (phys pin 18)**, **VCC→3V3 (pin 1)**,
   **GND→pin 6**. Power from 3V3 so OUT can't exceed the Pi's 3.3V-only GPIO; if
   the sensor needs 5V (pin 2/4), level-shift/divide OUT down to 3.3V first.
