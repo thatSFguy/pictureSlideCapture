@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import queue
 import re
 import shutil
 import subprocess
@@ -36,6 +37,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote, urlparse, parse_qs
 
+import brightness
 import jpegstats
 from advance import ADVANCE_DEFAULTS, AdvanceError, make_advancer
 from camera import Camera, CameraError
@@ -115,6 +117,113 @@ trigger = None
 # then restore the baseline shutter. Fixes the odd dense slide in place during
 # an auto-run without pushing every following slide off. Default off.
 RESHOOT = {"enabled": False, "max": 1}
+
+# Digital brightness correction: after a capture, pull a frame that metered
+# dark/bright onto a target brightness by re-encoding it with a gamma curve
+# (see brightness.py). Complements auto-reshoot — this costs no shutter
+# actuation and no extra capture cycle, but can't recover clipped highlights.
+BRIGHTNESS = dict(brightness.DEFAULTS)
+
+
+def set_brightness(cfg: dict) -> dict:
+    """Merge + clamp brightness-correction settings."""
+    if "enabled" in cfg:
+        BRIGHTNESS["enabled"] = bool(cfg["enabled"])
+    if cfg.get("mode") in ("flagged", "all"):
+        BRIGHTNESS["mode"] = cfg["mode"]
+    if "keep_original" in cfg:
+        BRIGHTNESS["keep_original"] = bool(cfg["keep_original"])
+    for key, lo, hi, cast in (("target", 60, 200, int), ("max_ev", 0.25, 3.0, float),
+                              ("quality", 60, 100, int)):
+        if key in cfg:
+            try:
+                BRIGHTNESS[key] = max(lo, min(hi, cast(cfg[key])))
+            except (TypeError, ValueError):
+                pass
+    _persist_config()
+    return dict(BRIGHTNESS)
+
+
+def public_brightness() -> dict:
+    """Brightness config plus what the UI needs to explain itself."""
+    return {**BRIGHTNESS, "available": brightness.available(),
+            "describe": brightness.describe(BRIGHTNESS),
+            "pending": _bright_q.qsize()}
+
+
+# Correction runs on a worker thread, NOT in the capture path: a 10 MP
+# decode+encode is seconds of CPU (10-15 s on a Pi Zero W) and the operator's
+# hands-on loop is only ~18 s/slide. Queuing it keeps the Capture button snappy
+# and lets the next shot fire while the previous one is still being corrected.
+# One worker (not a pool) so a single-core Pi never thrashes; Review's 4 s
+# auto-sync surfaces each frame's final state as the queue drains.
+_bright_q: queue.Queue = queue.Queue()
+_sidecar_lock = threading.Lock()      # sidecar JSON is read-modify-write
+
+
+def update_exposure(name: str, status: str | None) -> None:
+    """Set (or clear) one file's cached exposure verdict, atomically enough for
+    the worker and the capture thread to both touch it."""
+    with _sidecar_lock:
+        ex = load_exposure()
+        if status:
+            ex[name] = status
+        elif ex.pop(name, None) is None:
+            return
+        save_exposure(ex)
+
+
+def _bright_worker() -> None:
+    """Drain the correction queue. Never raises — a failed correction leaves the
+    original capture in place, which is always a valid outcome."""
+    while True:
+        item = _bright_q.get()
+        try:
+            _correct_one(*item)
+        except Exception as e:                     # belt and braces: keep draining
+            print(f"[brightness] worker error: {e}", flush=True)
+        finally:
+            _bright_q.task_done()
+
+
+def _correct_one(path: Path, plan: dict, token: tuple | None) -> None:
+    t0 = time.monotonic()
+    if not path.is_file():
+        return                                     # deleted/redone while queued
+    try:
+        res = brightness.correct(path, plan,
+                                 keep_original=BRIGHTNESS["keep_original"],
+                                 quality=BRIGHTNESS["quality"], expect=token)
+    except brightness.BrightnessError as e:
+        print(f"[brightness] {path.name}: {e}", flush=True)
+        return
+    # The correction rewrote the file, so re-apply the group/caption metadata
+    # and re-meter (fast — it reads the thumbnail we just corrected too).
+    write_metadata(path, None, load_captions().get(path.name, ""))
+    stats = jpegstats.luma_stats(path)
+    update_exposure(path.name, (stats or {}).get("status"))
+    print(f"[brightness] {path.name}: {res['ev']:+.2f} EV "
+          f"(gamma {res['gamma']}) -> {(stats or {}).get('status', '?')} "
+          f"in {time.monotonic() - t0:.1f}s", flush=True)
+
+
+def queue_brightness(jpg: Path | None, stats: dict | None,
+                     derived: bool = False) -> dict | None:
+    """Plan a correction for a fresh capture and queue it. Returns the planned
+    correction (for the capture response) or None if the frame is left alone.
+
+    Skips RAW-derived previews: with imageformat=RAW the JPEG is only a preview
+    extracted from the CR2, and the CR2 is what actually gets developed."""
+    if jpg is None or derived or not BRIGHTNESS["enabled"]:
+        return None
+    if not brightness.available():
+        return None
+    plan = brightness.plan(stats, BRIGHTNESS)
+    if plan:
+        # Token the file as it is NOW: the worker refuses to swap if Redo-last
+        # (or a delete) replaced this frame while it sat in the queue.
+        _bright_q.put((jpg, plan, brightness.identity(jpg)))
+    return plan
 
 
 def set_reshoot(cfg: dict) -> dict:
@@ -206,9 +315,11 @@ def public_trigger() -> dict:
 
 def read_sensor() -> dict:
     """Current raw sensor level + its interpretation (for polarity setup). Also
-    carries trigger + reshoot config so the Setup UI can restore both toggles
-    without the (lock-gated) status call — they populate even when busy."""
-    base = {"trigger": public_trigger(), "reshoot": dict(RESHOOT)}
+    carries the trigger + reshoot + brightness config so the Setup UI can restore
+    all three toggles without the (lock-gated) status call — they populate even
+    when the camera is busy."""
+    base = {"trigger": public_trigger(), "reshoot": dict(RESHOOT),
+            "brightness": public_brightness()}
     try:
         lvl = read_level(TRIGGER)
     except TriggerError as e:
@@ -349,6 +460,7 @@ def _persist_config() -> None:
     _save_sidecar("config.json", {
         "trigger": {k: TRIGGER[k] for k in TRIGGER_DEFAULTS},
         "reshoot": dict(RESHOOT),
+        "brightness": dict(BRIGHTNESS),
         "advance": {k: ADVANCE[k] for k in ADVANCE_DEFAULTS},
     })
 
@@ -629,16 +741,19 @@ def do_capture() -> dict:
             stem, jpg, raw, derived, stats)
     write_metadata(jpg, raw)
     if stats:                                      # cache verdict for Review
-        ex = load_exposure()
-        ex[jpg.name] = stats.get("status")
-        save_exposure(ex)
+        update_exposure(jpg.name, stats.get("status"))
+    # Digital brightness correction (queued; the worker rewrites the file and
+    # re-meters it). Runs AFTER any optical reshoot, so it only has to fix what
+    # the shutter couldn't — and it never touches the RAW sibling.
+    corr = queue_brightness(jpg, stats, derived)
     # Auto-advance to the next slide (no-op unless enabled). The image is
     # already saved, so a failed advance is reported, not fatal.
     adv = _advance_once() if (advancer.enabled and ADVANCE.get("after_capture")) \
         else None
     return {"ok": True, "name": jpg.name, "index": n, "count": image_count(prefix),
             "raw": raw.name if raw else None, "preview_from_raw": derived,
-            "exposure": stats, "advance": adv, "reshoots": reshoots}
+            "exposure": stats, "advance": adv, "reshoots": reshoots,
+            "brightness": corr}
 
 
 def do_advance() -> dict:
@@ -741,7 +856,7 @@ def read_status() -> dict:
         return {"connected": False, "error": friendly(str(e)), "prefix": PREFIX,
                 "count": image_count(PREFIX), "recent": recent_images(PREFIX),
                 "captions": load_captions(), "exposure": load_exposure(),
-                "reshoot": dict(RESHOOT)}
+                "reshoot": dict(RESHOOT), "brightness": public_brightness()}
     mode = v.get("autoexposuremode", "?")
     return {
         "connected": True, "model": model,
@@ -752,6 +867,7 @@ def read_status() -> dict:
         "prefix": PREFIX, "count": image_count(PREFIX),
         "recent": recent_images(PREFIX), "captions": load_captions(),
         "exposure": load_exposure(), "reshoot": dict(RESHOOT),
+        "brightness": public_brightness(),
     }
 
 
@@ -803,7 +919,8 @@ def read_images(offset: int, limit: int) -> dict:
     caps, ex = load_captions(), load_exposure()
     page = imgs[offset:offset + limit]
     items = [{"name": f.name, "caption": caps.get(f.name, ""),
-              "exposure": ex.get(f.name, ""), "mtime": _mtime(f)} for f in page]
+              "exposure": ex.get(f.name, ""), "mtime": _mtime(f),
+              "orig": brightness.has_original(f)} for f in page]
     return {"prefix": PREFIX, "total": len(imgs), "offset": offset,
             "limit": limit, "items": items}
 
@@ -875,7 +992,8 @@ def update_check() -> dict:
             "latest": latest, "available": available, "url": UPDATE_URL}
 
 
-_APP_MODULES = ["capture_server.py", "camera.py", "jpegstats.py", "advance.py"]
+_APP_MODULES = ["capture_server.py", "camera.py", "jpegstats.py", "advance.py",
+                "brightness.py", "trigger.py", "gpiocli.py"]
 
 
 def _app_syntax_ok() -> tuple[bool, str]:
@@ -918,6 +1036,109 @@ def _restart_service() -> None:
                    capture_output=True, text=True)
 
 
+# ---- optional-feature install (no SSH needed) ------------------------------
+# The appliance is a sealed box: the operator has no shell and no sudo, and the
+# in-app self-update pulls CODE from git but can't pull apt packages. So an
+# optional native dependency (python3-pil, for brightness correction) would
+# otherwise need a full re-flash. The service user already has passwordless
+# sudo — the same one behind "View logs" and the updater's restart — so the app
+# can install it on request instead.
+#
+# SECURITY: the request names a FEATURE from this fixed table, never a package.
+# Nothing user-supplied ever reaches the apt command line. (When the sudoers
+# allowlist hardening lands, apt-get needs an entry here too.)
+APT_FEATURES = {
+    "brightness": {"packages": ["python3-pil"],
+                   "label": "brightness correction",
+                   "verify": brightness.available},
+}
+
+# NOTE: the install RESULT is "success", not "ok" — every JSON response here
+# already uses "ok" for "the request itself worked", and merging the two
+# silently overwrote it (a started install replied {"ok": null}).
+_install = {"running": False, "feature": None, "success": None, "log": "",
+            "started": 0.0}
+_install_lock = threading.Lock()
+
+
+def _status_from(d: dict) -> dict:
+    """Shape a status snapshot. Callers hold (or don't need) _install_lock —
+    this must NOT take it, or a caller already holding it self-deadlocks."""
+    out = dict(d)
+    out["elapsed"] = round(time.monotonic() - d["started"], 1) if d["started"] else 0
+    out["log"] = d["log"][-4000:]               # tail only; the UI shows a slice
+    return out
+
+
+def install_status() -> dict:
+    with _install_lock:
+        return _status_from(_install)
+
+
+def _log_install(text: str) -> None:
+    with _install_lock:
+        _install["log"] += text
+
+
+def _install_worker(feature: str, spec: dict) -> None:
+    """apt-get update + install, then re-check. Runs off the request thread:
+    on a Pi Zero W over WiFi this is minutes, far past any browser timeout, so
+    the UI starts it and polls GET /api/install instead of waiting."""
+    ok = False
+    try:
+        for label, cmd, timeout in (
+                ("Refreshing the package list",
+                 ["sudo", "-n", "apt-get", "update"], 600),
+                (f"Installing {' '.join(spec['packages'])}",
+                 ["sudo", "-n", "env", "DEBIAN_FRONTEND=noninteractive",
+                  "apt-get", "install", "-y", "--no-install-recommends",
+                  *spec["packages"]], 1800)):
+            _log_install(f"\n=== {label} ===\n")
+            try:
+                r = subprocess.run(cmd, capture_output=True, text=True,
+                                   timeout=timeout)
+            except (OSError, subprocess.TimeoutExpired) as e:
+                _log_install(f"FAILED: {e}\n")
+                return
+            _log_install((r.stdout or "") + (r.stderr or ""))
+            if r.returncode != 0:
+                _log_install(f"\napt exited {r.returncode}\n")
+                return
+        # A package installed after startup is invisible until the import
+        # machinery re-scans dist-packages; no service restart needed.
+        import importlib
+        importlib.invalidate_caches()
+        ok = bool(spec["verify"]())
+        _log_install(f"\n=== {'Installed and working' if ok else 'Installed, but '
+                     'still not importable — restart the app'} ===\n")
+    finally:
+        with _install_lock:
+            _install["running"], _install["success"] = False, ok
+        print(f"[install] {feature}: {'ok' if ok else 'FAILED'}", flush=True)
+
+
+def start_install(feature: str) -> dict:
+    spec = APT_FEATURES.get(feature)
+    if not spec:
+        return {"ok": False, "error": "unknown feature"}
+    if spec["verify"]():
+        return {"ok": True, "already": True, **install_status()}
+    held = lock_status()                        # don't steal CPU mid-capture
+    if held:
+        return {"ok": False, "error": f"camera busy ({held.get('who')}) — "
+                "try again when the batch is finished"}
+    with _install_lock:
+        if _install["running"]:                 # already going: report, don't stack
+            return {"ok": True, **_status_from(_install)}
+        _install.update({"running": True, "feature": feature, "success": None,
+                         "log": f"Installing {spec['label']}…\n",
+                         "started": time.monotonic()})
+        started = _status_from(_install)
+    threading.Thread(target=_install_worker, args=(feature, spec),
+                     name="install", daemon=True).start()
+    return {"ok": True, **started}
+
+
 # ---- diagnostics (in-app troubleshooting, no SSH needed) -------------------
 _DIAG_KEYS = ["capturetarget", "imageformat", "autoexposuremode",
               "availableshots", "batterylevel"]
@@ -948,7 +1169,7 @@ def read_diag() -> dict:
          "prefix": PREFIX, "have_exiftool": HAVE_EXIFTOOL,
          "advance_mode": ADVANCE.get("mode"),
          "trigger": public_trigger(), "reshoot": dict(RESHOOT),
-         "camera_lock": lock_status()}
+         "brightness": public_brightness(), "camera_lock": lock_status()}
     try:
         d["gphoto2"] = (subprocess.run(["gphoto2", "--version"],
                         capture_output=True, text=True, timeout=10)
@@ -1077,7 +1298,7 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/settings":
             self._with_camera(read_settings)
         elif path == "/api/zip":
-            self._serve_zip()
+            self._serve_zip(originals=q.get("originals", ["1"])[0] != "0")
         elif path == "/api/version":
             self._json({"version": app_version()})
         elif path == "/api/update":
@@ -1092,6 +1313,10 @@ class Handler(BaseHTTPRequestHandler):
             self._with_camera(read_diag)   # camera snapshot needs the lock
         elif path == "/api/trigger":
             self._json(read_sensor())      # config + live level (for polarity)
+        elif path == "/api/brightness":
+            self._json({"ok": True, "brightness": public_brightness()})
+        elif path == "/api/install":
+            self._json({**install_status(), "brightness": public_brightness()})
         elif path == "/api/exposure":
             f = self._safe(unquote(q.get("name", [""])[0]))
             stats = jpegstats.luma_stats(f) if f and f.is_file() else None
@@ -1106,7 +1331,8 @@ class Handler(BaseHTTPRequestHandler):
         elif path.startswith("/thumb/"):
             self._serve_thumb(unquote(path[len("/thumb/"):]))
         elif path.startswith("/media/"):
-            self._serve_media(unquote(path[len("/media/"):]), "dl" in q)
+            self._serve_media(unquote(path[len("/media/"):]), "dl" in q,
+                              orig="orig" in q)
         else:
             self._send(404, b"not found", "text/plain")
 
@@ -1130,6 +1356,16 @@ class Handler(BaseHTTPRequestHandler):
                             "trigger": public_trigger()}, 400)
         elif path == "/api/reshoot":
             self._json({"ok": True, "reshoot": set_reshoot(self._body())})
+        elif path == "/api/brightness":
+            set_brightness(self._body())
+            b = public_brightness()
+            self._json({"ok": True, "brightness": b,
+                        "warning": None if (b["available"] or not b["enabled"])
+                        else brightness.unavailable_reason()})
+        elif path == "/api/revert":
+            self._revert(self._body().get("name", ""))
+        elif path == "/api/install":
+            self._json(start_install(self._body().get("feature", "")))
         elif path == "/api/deleteall":
             self._delete_all(self._body().get("prefix", ""))
         elif path == "/api/debugcapture":
@@ -1158,8 +1394,13 @@ class Handler(BaseHTTPRequestHandler):
             return None
         return OUT_DIR / name
 
-    def _serve_media(self, name: str, download: bool):
+    def _serve_media(self, name: str, download: bool, orig: bool = False):
         f = self._safe(name)
+        # ?orig=1 serves the pre-correction copy so Review can compare before
+        # reverting. _safe() already rejected any path separator, so this can
+        # only ever resolve inside captures/originals/.
+        if f is not None and orig:
+            f = brightness.original_for(f)
         if f is None or not f.is_file():
             return self._send(404 if f else 403, b"not found", "text/plain")
         ctype = "image/jpeg" if f.suffix.lower() in IMAGE_EXTS \
@@ -1188,6 +1429,7 @@ class Handler(BaseHTTPRequestHandler):
         removed = []
         for sib in OUT_DIR.glob(f.stem + ".*"):   # jpg + its cr2 sibling
             try:
+                brightness.discard_original(sib)  # + its pre-correction original
                 sib.unlink()
                 removed.append(sib.name)
             except OSError:
@@ -1202,6 +1444,21 @@ class Handler(BaseHTTPRequestHandler):
         self._json({"ok": bool(removed), "removed": removed,
                     "count": image_count(PREFIX), "recent": recent_images(PREFIX)})
 
+    def _revert(self, name: str):
+        """Undo a brightness correction: put the stashed original back and
+        re-meter. The stash is consumed, so the frame reads as uncorrected."""
+        f = self._safe(name)
+        if f is None or not f.is_file():
+            return self._json({"ok": False, "error": "bad name"}, 400)
+        if not brightness.revert(f):
+            return self._json({"ok": False,
+                               "error": "no original kept for this frame"}, 404)
+        write_metadata(f, None, load_captions().get(f.name, ""))
+        stats = jpegstats.luma_stats(f)
+        update_exposure(f.name, (stats or {}).get("status"))
+        self._json({"ok": True, "name": f.name, "exposure": stats,
+                    "mtime": _mtime(f)})
+
     def _delete_all(self, prefix: str):
         """Delete every image in the CURRENT group (+ RAW siblings) and clear its
         caption/exposure caches. Guarded: the client must echo the current prefix
@@ -1213,6 +1470,7 @@ class Handler(BaseHTTPRequestHandler):
         for img in group_images(PREFIX):
             for sib in OUT_DIR.glob(img.stem + ".*"):   # jpg + cr2 sibling
                 try:
+                    brightness.discard_original(sib)    # + pre-correction copy
                     sib.unlink()
                     removed.append(sib.name)
                 except OSError:
@@ -1248,11 +1506,17 @@ class Handler(BaseHTTPRequestHandler):
         write_metadata(jpg, raw, caption)
         self._json({"ok": True, "name": name, "caption": caption})
 
-    def _serve_zip(self):
+    def _serve_zip(self, originals: bool = True):
         rx = name_re(PREFIX)
         files = [f for f in sorted(OUT_DIR.glob(f"{PREFIX}_*")) if rx.match(f.name)]
         if not files:
             return self._send(404, b"no files in group", "text/plain")
+        # Pre-correction copies ride along under originals/ — otherwise
+        # download-all + delete-all would silently discard them and bake every
+        # brightness correction in permanently. ?originals=0 opts out when the
+        # doubled zip size matters more.
+        extra = [brightness.original_for(f) for f in files] if originals else []
+        extra = [f for f in extra if f.is_file()]
         # Build to a temp file on the SAME disk (not /tmp, which is tmpfs/RAM on
         # the Pi), then stream it — avoids buffering a whole batch in 512 MB RAM.
         tmp = tempfile.NamedTemporaryFile(dir=OUT_DIR, suffix=".zip", delete=False)
@@ -1260,6 +1524,8 @@ class Handler(BaseHTTPRequestHandler):
             with zipfile.ZipFile(tmp, "w", zipfile.ZIP_STORED) as z:
                 for f in files:
                     z.write(f, f.name)
+                for f in extra:
+                    z.write(f, f"{brightness.ORIGINALS_DIR}/{f.name}")
             size = tmp.tell()
             tmp.seek(0)
             self.send_response(200)
@@ -1515,6 +1781,33 @@ INDEX_HTML = r"""<!doctype html>
           <em>same</em> frame is reshot (keeping the best), then the baseline shutter is restored. Each reshoot
           adds a few seconds — leave enough gap before the next slide arrives.</div>
       </div>
+      <div class="card">
+        <h3>Brightness correction</h3>
+        <label class="tog"><input type="checkbox" id="brOn">Auto-correct brightness after each shot</label>
+        <div class="grid2" style="margin-top:.5rem">
+          <div><label>Correct</label><select id="brMode">
+            <option value="flagged">Only dark / bright frames</option>
+            <option value="all">Every frame (even batch)</option>
+          </select></div>
+          <div><label>Aim for</label><select id="brTarget">
+            <option value="95">Darker (95)</option>
+            <option value="110">Normal (110)</option>
+            <option value="130">Brighter (130)</option>
+          </select></div>
+          <div><label>Max correction</label><select id="brMaxEv">
+            <option value="1">±1 stop</option>
+            <option value="1.5">±1.5 stops</option>
+            <option value="2">±2 stops</option>
+          </select></div>
+        </div>
+        <label class="tog" style="margin-top:.5rem"><input type="checkbox" id="brKeep">Keep the untouched original (lets Review undo)</label>
+        <div class="diagrow" style="margin-top:.5rem"><button id="brSave">Save</button>
+          <button id="brInstall" style="display:none">⬇ Install brightness support</button></div>
+        <div class="note" id="brMsg">Fixes the fixed-backlight problem in the pixels: a frame that meters
+          dark is pulled up with a gamma curve — no extra shot, no shutter wear. Bounded by the max above,
+          and the original is kept so Review can undo it. Highlights already blown can’t be recovered
+          (that needs auto-reshoot); RAW files are never modified.</div>
+      </div>
      </div>
     </div>
     <button id="startCap">Start capturing →</button>
@@ -1543,7 +1836,7 @@ INDEX_HTML = r"""<!doctype html>
       <span id="revInfo">–</span>
       <label class="tog"><input type="checkbox" id="flagOnly">Only flagged</label>
       <button id="revRefresh">↻ Refresh</button>
-      <button id="revZip">⬇ Download all (zip)</button>
+      <button id="revZip" title="Includes an originals/ folder holding the untouched version of every brightness-corrected frame">⬇ Download all (zip)</button>
       <button id="revDelAll" class="del">🗑 Delete all</button>
     </div>
     <div id="gridwrap">
@@ -1564,6 +1857,8 @@ INDEX_HTML = r"""<!doctype html>
     <input id="lbCaption" placeholder="Caption for this image…" maxlength="300">
     <button id="lbSave">Save</button>
     <button id="lbDl">⬇</button>
+    <button id="lbOrig" style="display:none">👁 Original</button>
+    <button id="lbRevert" style="display:none">↩ Undo brighten</button>
     <button id="lbDel" class="del">🗑 Delete</button>
     <button id="lbClose">Close (Esc)</button>
   </div>
@@ -1574,11 +1869,13 @@ INDEX_HTML = r"""<!doctype html>
 const $ = s => document.querySelector(s);
 const EXP = ['imageformat','iso','aperture','shutterspeed','whitebalance'];
 const EXPO = {ok:['✓ Good','good'],dark:['⚠ A bit dark','warn'],bright:['⚠ A bit bright','warn'],
-              under:['✕ Too dark','bad'],over:['✕ Overexposed','bad']};
+              under:['✕ Too dark','bad'],over:['✕ Overexposed','bad'],
+              correcting:['✨ Brightness correcting…','good']};
 const FLAG = {dark:1,bright:1,under:1,over:1};
 let mode='setup', ST={recent:[],captions:{},exposure:{},prefix:'slide',count:0};
 let capIdx=0, busy=false;
 let rev={items:[],total:0,offset:0,limit:60,lbIdx:-1};
+const BR_NOTE = $('#brMsg').textContent;    // restored after a transient message
 
 function toast(t,kind){ const el=$('#toast'); el.textContent=t; el.className=kind||'';
   el.style.display='block'; clearTimeout(toast._t); toast._t=setTimeout(()=>el.style.display='none',2500); }
@@ -1610,6 +1907,7 @@ async function status(){
     if(document.activeElement!==$('#reshootOn')) $('#reshootOn').checked=!!s.reshoot.enabled;
     if(document.activeElement!==$('#reshootMax')) $('#reshootMax').value=s.reshoot.max||1;
   }
+  if(s.brightness) fillBright(s.brightness);
   $('#pfxEx').textContent=ST.prefix; if(!$('#prefix').value) $('#prefix').value=ST.prefix;
   $('#grpcount').textContent=ST.prefix+' · '+ST.count;
   if(!s.connected){ $('#camstat').textContent=s.error?'no camera':'no camera'; $('#camstat').className='pill bad';
@@ -1644,9 +1942,14 @@ async function capture(){
   try{
     const d=await jpost('/api/capture');
     if(d.ok){ ST.count=d.count; ST.recent.unshift(d.name); if(d.exposure) ST.exposure[d.name]=d.exposure.status;
+      // A queued correction rewrites the file a few seconds later; show that
+      // it's handled rather than the (now stale) "too dark" verdict. The next
+      // status poll replaces it with the real post-correction reading.
+      if(d.brightness) ST.exposure[d.name]='correcting';
       capIdx=0; $('#grpcount').textContent=ST.prefix+' · '+ST.count; renderCap();
       const rs=(d.reshoots&&d.reshoots.length)?' (reshot ×'+d.reshoots.length+')':'';
-      $('#capMsg').textContent='Saved '+d.name+rs; $('#capMsg').className='ok'; }
+      const br=d.brightness?(' · brightening '+(d.brightness.ev>0?'+':'')+d.brightness.ev+' EV'):'';
+      $('#capMsg').textContent='Saved '+d.name+rs+br; $('#capMsg').className='ok'; }
     else { $('#capMsg').textContent=d.error||'capture failed'; $('#capMsg').className='err'; toast(d.error||'capture failed','err'); beep(); }
   }catch(e){ $('#capMsg').textContent='network error'; $('#capMsg').className='err'; beep(); }
   finally{ busy=false; $('#spinner').style.display='none'; $('#shoot').disabled=false; }
@@ -1751,10 +2054,64 @@ function fillReshoot(r){ if(!r) return;
   if(document.activeElement!==$('#reshootOn')) $('#reshootOn').checked=!!r.enabled;
   if(document.activeElement!==$('#reshootMax')) $('#reshootMax').value=r.max||1;
 }
+function fillBright(b){ if(!b) return;
+  const set=(id,v)=>{ if(document.activeElement!==$(id)) $(id).value=v; };
+  if(document.activeElement!==$('#brOn')) $('#brOn').checked=!!b.enabled;
+  if(document.activeElement!==$('#brKeep')) $('#brKeep').checked=!!b.keep_original;
+  set('#brMode', b.mode||'flagged');
+  set('#brTarget', String(b.target||110));
+  set('#brMaxEv', String(b.max_ev||1.5));
+  $('#brOn').disabled = !b.available;
+  // The appliance has no shell, so offer to install the missing piece in place
+  // rather than telling the operator to run apt (they can't).
+  $('#brInstall').style.display = b.available ? 'none' : 'inline-block';
+  if(!b.available && !installing) $('#brMsg').textContent =
+    'Needs one extra system package (python3-pil) that isn’t on this machine yet. '
+    + 'Tap “Install brightness support” — the scanner fetches it itself, about a '
+    + 'minute on WiFi. No restart, nothing to plug in.';
+  else if(installing) { /* the installer owns the message while it runs */ }
+  else if(b.pending) $('#brMsg').textContent = b.pending+' frame'+(b.pending===1?'':'s')
+    +' still being corrected in the background…';
+  else $('#brMsg').textContent = BR_NOTE;
+}
+/* ---- in-app install of the optional native dependency ---- */
+let installing=false;
+async function installBrightness(){
+  if(installing) return;
+  const d=await jpost('/api/install',{feature:'brightness'});
+  if(d.ok===false){ $('#brMsg').textContent=d.error||'Could not start the install.';
+    toast(d.error||'install failed','err'); return; }
+  if(d.already){ fillBright(d.brightness); toast('Already installed','ok'); return; }
+  installing=true; $('#brInstall').disabled=true;
+  $('#brMsg').textContent='Installing… this takes a minute or two on WiFi. '
+    + 'Leave this page open.';
+  const iv=setInterval(async()=>{
+    let s; try{ s=await jget('/api/install'); }catch(e){ return; }
+    if(s.running){ $('#brMsg').textContent='Installing… ('+Math.round(s.elapsed)
+      +'s) '+(s.log||'').trim().split('\n').pop().slice(0,80); return; }
+    clearInterval(iv); installing=false; $('#brInstall').disabled=false;
+    fillBright(s.brightness);
+    if(s.success){ $('#brMsg').textContent=BR_NOTE;
+      toast('Brightness correction is ready','ok'); }
+    else { $('#brMsg').textContent='Install failed — tap View logs under System, '
+      + 'or check the scanner is on WiFi. Last output: '
+      + (s.log||'').trim().split('\n').slice(-3).join(' ').slice(0,200); }
+  }, 2500);
+}
+async function saveBright(){
+  const d=await jpost('/api/brightness',{enabled:$('#brOn').checked,
+    mode:$('#brMode').value, target:parseInt($('#brTarget').value,10),
+    max_ev:parseFloat($('#brMaxEv').value), keep_original:$('#brKeep').checked});
+  if(d.ok){ fillBright(d.brightness);
+    if(d.warning){ $('#brMsg').textContent=d.warning; toast('Saved, but not active','warn'); }
+    else toast('Brightness correction: '+d.brightness.describe,'ok'); }
+  else toast('save failed','err');
+}
 async function loadTrigger(){
-  // Restores BOTH the sensor and reshoot toggles from the lock-free endpoint,
-  // so they show the saved state even when the camera is busy.
-  try{ const d=await jget('/api/trigger'); fillTrig(d.trigger); fillReshoot(d.reshoot); }
+  // Restores the sensor, reshoot AND brightness toggles from the lock-free
+  // endpoint, so they show the saved state even when the camera is busy.
+  try{ const d=await jget('/api/trigger'); fillTrig(d.trigger); fillReshoot(d.reshoot);
+    fillBright(d.brightness); }
   catch(e){}
 }
 async function saveTrigger(){
@@ -1821,7 +2178,8 @@ async function copyOut(){
 /* ---- review ---- */
 function eclass(st){ if(!st) return 'e-none'; if(st==='ok') return 'e-ok';
   if(st==='under'||st==='over') return 'e-bad'; return 'e-warn'; }
-function revSig(items){ return (items||[]).map(i=>i.name+':'+(i.caption||'')+':'+(i.exposure||'')+':'+(i.mtime||0)).join('|'); }
+function revSig(items){ return (items||[]).map(i=>i.name+':'+(i.caption||'')+':'+(i.exposure||'')
+  +':'+(i.mtime||0)+':'+(i.orig?1:0)).join('|'); }
 async function loadReview(reset){
   if(reset){ rev.items=[]; rev.offset=0; }
   const d=await jget('/api/images?offset='+rev.offset+'&limit='+rev.limit);
@@ -1844,7 +2202,11 @@ async function syncReview(){
 }
 async function deleteAll(){
   if(!rev.total){ toast('Nothing to delete','ok'); return; }
-  if(!confirm('Delete ALL '+rev.total+' image'+(rev.total===1?'':'s')+' in “'+ST.prefix+'”?\nThis cannot be undone — download first if you want to keep them.')) return;
+  const nOrig=rev.items.filter(i=>i.orig).length;
+  if(!confirm('Delete ALL '+rev.total+' image'+(rev.total===1?'':'s')+' in “'+ST.prefix+'”?\n'
+    +(nOrig?('This also deletes the pre-correction originals of '+nOrig+' brightened frame'
+      +(nOrig===1?'':'s')+'.\n'):'')
+    +'This cannot be undone — download first if you want to keep them (the zip includes the originals).')) return;
   const d=await jpost('/api/deleteall',{prefix:ST.prefix});
   if(d.ok){ toast('Deleted '+d.removed+' file'+(d.removed===1?'':'s'),'ok'); ST.count=d.count; loadReview(true); }
   else toast(d.error||'delete failed','err');
@@ -1867,8 +2229,29 @@ function renderGrid(){
 function openLB(idx){ rev.lbIdx=idx; const it=rev.items[idx]; if(!it) return;
   $('#lbImg').src='/media/'+encodeURIComponent(it.name)+'?v='+(it.mtime||Date.now());
   $('#lbCaption').value=it.caption||'';
-  $('#lbInfo').textContent=it.name+'  ·  '+(EXPO[it.exposure]?EXPO[it.exposure][0]:'exposure n/a');
+  $('#lbInfo').textContent=it.name+'  ·  '+(EXPO[it.exposure]?EXPO[it.exposure][0]:'exposure n/a')
+    +(it.orig?'  ·  brightness corrected':'');
+  // Only frames with a stashed pre-correction copy can be compared/undone.
+  $('#lbOrig').style.display=it.orig?'inline-block':'none';
+  $('#lbRevert').style.display=it.orig?'inline-block':'none';
+  $('#lbOrig').textContent='👁 Original';
   $('#lb').classList.add('open');
+}
+// Press-and-hold style toggle: flip the lightbox between the corrected frame
+// and the untouched original so a correction can be judged before undoing it.
+function lbToggleOrig(){ const it=rev.items[rev.lbIdx]; if(!it||!it.orig) return;
+  const b=$('#lbOrig'), showing=b.dataset.on==='1';
+  b.dataset.on = showing?'':'1';
+  b.textContent = showing?'👁 Original':'👁 Corrected';
+  const v=it.mtime||Date.now();
+  $('#lbImg').src='/media/'+encodeURIComponent(it.name)+(showing?('?v='+v):('?orig=1&v='+v));
+}
+async function lbRevert(){ const it=rev.items[rev.lbIdx]; if(!it) return;
+  if(!confirm('Undo the brightness correction on '+it.name+'?\\nThe original replaces it.')) return;
+  const d=await jpost('/api/revert',{name:it.name});
+  if(!d.ok){ toast(d.error||'undo failed','err'); return; }
+  it.orig=false; it.mtime=d.mtime||it.mtime; it.exposure=(d.exposure&&d.exposure.status)||'';
+  $('#lbOrig').dataset.on=''; openLB(rev.lbIdx); renderGrid(); toast('Reverted to the original','ok');
 }
 function closeLB(){ $('#lb').classList.remove('open'); rev.lbIdx=-1; }
 function lbNav(delta){ let i=rev.lbIdx+delta; if(i<0||i>=rev.items.length) return; openLB(i); }
@@ -1892,7 +2275,8 @@ $('#checkUpd').onclick=checkUpdate;
 $('#diagBtn').onclick=showDiag; $('#logBtn').onclick=showLogs;
 $('#logRefresh').onclick=refreshOut; $('#copyOut').onclick=copyOut;
 $('#trigSave').onclick=saveTrigger; $('#trigRead').onclick=readSensor;
-$('#reshootSave').onclick=saveReshoot;
+$('#reshootSave').onclick=saveReshoot; $('#brSave').onclick=saveBright;
+$('#brInstall').onclick=installBrightness;
 $('#startCap').onclick=()=>setMode('capture');
 $('#shoot').onclick=capture; $('#redo').onclick=redoLast;
 $('#revRefresh').onclick=()=>loadReview(true); $('#flagOnly').onchange=renderGrid;
@@ -1900,6 +2284,7 @@ $('#revZip').onclick=()=>location.href='/api/zip'; $('#loadMore').onclick=()=>lo
 $('#revDelAll').onclick=deleteAll;
 $('#lbNavL').onclick=()=>lbNav(-1); $('#lbNavR').onclick=()=>lbNav(1);
 $('#lbClose').onclick=closeLB; $('#lbDel').onclick=lbDelete; $('#lbSave').onclick=lbSave;
+$('#lbOrig').onclick=lbToggleOrig; $('#lbRevert').onclick=lbRevert;
 $('#lbDl').onclick=()=>{ const it=rev.items[rev.lbIdx]; if(it) location.href='/media/'+encodeURIComponent(it.name)+'?dl=1'; };
 
 document.addEventListener('keydown', e=>{
@@ -1984,6 +2369,8 @@ def main():
     saved = load_config()
     if isinstance(saved.get("reshoot"), dict):
         set_reshoot(saved["reshoot"])
+    if isinstance(saved.get("brightness"), dict):
+        set_brightness(saved["brightness"])
     if isinstance(saved.get("advance"), dict):
         try:
             set_advance(saved["advance"])
@@ -2004,6 +2391,12 @@ def main():
             print(f"Sensor trigger:  {trigger.describe()}")
     except TriggerError as e:
         print(f"  sensor trigger not started ({e}) — enable it later in Setup.")
+
+    # Brightness-correction worker (daemon: a queued frame is never more
+    # valuable than a clean shutdown — the untouched capture is already saved).
+    threading.Thread(target=_bright_worker, name="brightness",
+                     daemon=True).start()
+    print(f"Brightness:      {brightness.describe(BRIGHTNESS)}")
 
     srv = ThreadingHTTPServer((args.host, args.port), Handler)
     print(f"\nServing at http://{args.host}:{args.port}  (Ctrl-C to stop)")

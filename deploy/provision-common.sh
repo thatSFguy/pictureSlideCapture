@@ -4,7 +4,9 @@
 #   - deploy/provision-image.sh (CI, inside a Pi OS image under QEMU)
 # Source this after setting: REPO_DIR, TARGET_USER, OUT_DIR, PORT.  Run as root.
 
-PKGS="gphoto2 avahi-daemon git gpiod"    # git: self-update; gpiod: sensor trigger + motor advance
+# git: self-update; gpiod: sensor trigger + motor advance;
+# python3-pil: digital brightness correction (brightness.py — apt, not pip)
+PKGS="gphoto2 avahi-daemon git gpiod python3-pil"
 
 pc_install_packages() {
   export DEBIAN_FRONTEND=noninteractive

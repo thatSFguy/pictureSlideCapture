@@ -161,7 +161,8 @@ No live view, so use a capture-analyze-correct loop instead:
   so physical negatives can be located later
 
 ## Slide Capture Web App (current deliverable)
-Files (all in repo root, stdlib only):
+Files (all in repo root; stdlib only, with one OPTIONAL apt dependency —
+`python3-pil` for `brightness.py`, which no-ops without it):
 - `camera.py` — shared camera control: gphoto2 CLI wrapper, one subprocess per
   op, retry-on-IO-error, get/set config, capture. Used by both tools.
   `ready()`/`wait_ready()` probe the camera for the next shot: the 400D drops off
@@ -190,6 +191,28 @@ Files (all in repo root, stdlib only):
     baseline shutter. Fixes the odd dense slide in place during an auto-run
     without drifting the rest. Reshoot captures go to temp stems, the winner is
     promoted onto the frame, so an overshoot never leaves it worse. Default off.
+  - `GET /api/brightness` / `POST /api/brightness` — digital brightness
+    correction config (`enabled`/`mode`/`target`/`max_ev`/`keep_original`), plus
+    `available` (is python3-pil installed) and `pending` (queue depth). Lock-free
+    like `/api/trigger`, so the Setup toggle shows its real state mid-capture.
+  - `POST /api/revert` — undo a brightness correction: restore the stashed
+    original over the corrected frame and re-meter it
+  - `GET /api/install` / `POST /api/install` — install an optional native
+    dependency **from inside the app**, for an appliance whose operator has no
+    shell and no sudo (self-update ships code, not apt packages). Runs
+    `sudo -n apt-get update && apt-get install -y <pkgs>` on a background thread
+    (minutes on a Pi Zero W — way past any browser timeout), so POST starts it
+    and the UI polls GET for `running`/`elapsed`/`log`/`success`. No restart
+    needed: `importlib.invalidate_caches()` then re-verify. Refuses to start
+    while the camera lock is held so it can't steal CPU mid-batch.
+    **Security:** the request names a *feature* from the fixed `APT_FEATURES`
+    table (`brightness` → `python3-pil`); no client string ever reaches the apt
+    command line. When the sudoers NOPASSWD:ALL → allowlist hardening lands,
+    `apt-get` needs an entry. Two API traps found and fixed while building it:
+    the install RESULT field must NOT be called `ok` (it merged over the
+    request-level `ok`, so a started install replied `{"ok": null}`), and the
+    status snapshot helper must not re-take `_install_lock` (a second install
+    request — double-tap, or a second tab — deadlocked that request thread).
   - `GET /api/version` — current app version (`git describe`)
   - `GET /api/update` — check origin for a newer release tag; `POST /api/update`
     — check out the latest tag + restart the service (in-app self-update; git +
@@ -206,12 +229,62 @@ Files (all in repo root, stdlib only):
   - `POST /api/deleteall` — delete the whole current group + RAW siblings and
     clear its caption/exposure caches (prefix-guarded so a stale tab can't wipe
     the wrong group); Review "Delete all" button, for clearing after download
-  - `GET /media/<file>` (path-traversal guarded; `?dl=1` forces download)
+  - `GET /media/<file>` (path-traversal guarded; `?dl=1` forces download,
+    `?orig=1` serves the pre-correction copy from `captures/originals/`)
   - `GET /thumb/<file>` — tiny embedded EXIF thumbnail (fast Review grid)
   - `GET /api/images?offset=&limit=` — paginated group listing (name, caption,
     cached exposure) for Review
-  - `GET /api/zip` — zip of the current group (download-all)
+  - `GET /api/zip` — zip of the current group (download-all). Pre-correction
+    copies ride along under `originals/` in the archive; without that,
+    download-all + delete-all would silently discard them and bake every
+    brightness correction in permanently. `?originals=0` opts out (halves the
+    zip when every frame was corrected).
   - `GET /api/exposure?name=` — on-demand exposure stats for an image
+- `brightness.py` — **digital brightness correction** (the fixed-backlight fix).
+  Slide density varies per frame and the light pad can't be re-dialed per shot,
+  so after each capture a flagged frame is pulled onto a target brightness by
+  re-encoding the JPEG. Complements `_auto_reshoot` (optical): this costs no
+  shutter actuation and no extra ~18s capture cycle, but can't recover clipped
+  highlights — reshoot is still the fix for those.
+  - **Curve = gamma, not linear gain**: `out = 255*(in/255)**g` with `g` solved
+    so the metered mean lands on `target`. Pins 0 and 255, so brightening can
+    never clip highlights (a linear gain would blow any specular hot spot).
+  - Bounded by `max_ev` (default ±1.5 stops) and skipped below `MIN_MEAN`=8 (a
+    blank/empty slot is noise, not an underexposure), so a genuinely dark night
+    slide can't be wrecked. The untouched capture is copied to
+    `captures/originals/<name>` (`keep_original`) — Review can compare
+    (`/media/<f>?orig=1`) and undo (`POST /api/revert`).
+  - **Needs `python3-pil` (apt, NOT pip — consistent with gphoto2/gpiod/
+    exiftool).** Pure Python can't re-encode a 10MP JPEG in usable time. Every
+    entry point degrades to a no-op when PIL is absent and the UI says so.
+    It is NOT bundleable as code: it's a C extension against libjpeg/zlib, and a
+    pure-Python decode+encode of a 10MP frame is minutes/frame on a Pi. (A
+    DCT-domain trick can shift brightness without a full decode, but only as a
+    linear DC offset — it lifts blacks and clips highlights, i.e. strictly worse
+    than the gamma curve. Rejected. Scaling the DC *quant table* is even worse:
+    it scales deviation from mid-gray, which is contrast, not brightness.)
+  - **Installing it needs no SSH** — see `APT_FEATURES` / `POST /api/install`
+    below. The appliance is sealed (no shell for the operator) and self-update
+    pulls code but not apt packages, so the app installs the package itself.
+    Re-flashing also works: `python3-pil` is now in `deploy` PKGS, so new images
+    ship with it.
+  - **Encoding fidelity:** re-encodes with the CAMERA's own quantization tables
+    (`qtables=src.quantization`) and chroma sampling (4:2:2 on the 400D) — no
+    second-generation quality cliff. `subsampling="keep"` does NOT work here:
+    `point()` returns a plain image, not a JPEG-backed one, and PIL raises
+    *"Cannot use 'keep' when original image is not a JPEG"* — which silently
+    fell back to quality-92 4:2:0 and shrank files ~40% before it was caught.
+    Use the numeric sampling from `JpegImagePlugin.get_sampling()` instead.
+    Expect a lifted frame to grow (~137% at +1.5EV): lifted shadows carry more
+    entropy at the same tables. That's honest, not a bug.
+  - **EXIF is spliced over byte-for-byte** from the original (keeps MakerNotes;
+    doesn't depend on PIL's exif-writing quirks) and the **embedded thumbnail is
+    put through the same curve** — otherwise Review's `/thumb` grid AND
+    `jpegstats` (which meters off that thumbnail) would both still report the
+    uncorrected frame. The thumbnail is re-encoded to fit its ORIGINAL byte slot
+    and only the length tag is patched, so every EXIF offset stays valid.
+  - **RAW is never touched**, and RAW-derived previews (`imageformat=RAW`, where
+    the JPEG is just extracted from the CR2) are skipped.
 - `jpegstats.py` — pure-stdlib JPEG luminance reader for the exposure aid;
   meters off the embedded EXIF thumbnail (fast) via a minimal baseline DC-only
   decoder, else the image. Returns mean/under/over + a status/advice, or None.
@@ -293,7 +366,9 @@ UI — three modes (built for high-volume, keyboard-first; see the redesign plan
   so the loop stays snappy.
 - **Review** (after): thumbnail grid via `/thumb` + `/api/images`, "only
   flagged" filter, lightbox to caption/delete/download, download-all zip, and
-  **Delete all** (clear the group after downloading). The grid **auto-syncs**
+  **Delete all** (clear the group after downloading). Brightness-corrected frames
+  get **👁 Original** (toggles the lightbox to `?orig=1`) and **↩ Undo brighten**
+  (`/api/revert`). The grid **auto-syncs**
   every 4s while active + on tab focus (reflects an ongoing auto-run's new
   frames and deletes from any device); paused while the lightbox is open.
 - Nav: `[` Setup, `]` Review; typing in inputs suppresses shortcuts.
@@ -313,12 +388,25 @@ Features:
   (see `jpegstats.py`), shown on capture and cached per file in `exposure.json`
   so Review flags the whole batch with no recompute. Heuristic; a guide, not a
   meter (less reliable on the orange mask of negatives).
+- **Brightness correction** (Setup → Brightness correction; see `brightness.py`):
+  after each capture, a flagged frame is queued for a gamma correction onto the
+  target. Runs on a **single background worker thread, NOT in the capture path**
+  — a 10MP decode+encode is ~0.5s on the dev box but 10-15s on a Pi Zero W,
+  against a ~18s/slide operator loop, so queuing keeps the Capture button snappy
+  and lets the next shot fire while the last one is still being corrected. The
+  capture response reports the planned `ev` (Capture shows "brightening +0.9 EV"
+  and a `correcting` chip); the worker then rewrites the file, re-applies the
+  group/caption metadata, and re-meters, which Review's 4s auto-sync picks up.
+  **Stale-swap guard:** group filenames get reused (Redo-last frees a number and
+  the next shot takes it back), so each queued job carries a size+mtime token and
+  the worker refuses to swap if the frame changed while it was queued — otherwise
+  a slow correction could drop stale pixels onto a brand-new capture.
 - **File management**: per-image download/delete + download-all zip.
-- **Settings persistence**: sensor-trigger, auto-reshoot, and advance config are
-  saved to `config.json` and restored at startup, so they survive the
-  self-update restart (which used to reset them to off). The trigger + reshoot
-  toggles also load from the lock-free `/api/trigger`, so the UI shows their real
-  state even while the camera is busy.
+- **Settings persistence**: sensor-trigger, auto-reshoot, brightness and advance
+  config are saved to `config.json` and restored at startup, so they survive the
+  self-update restart (which used to reset them to off). The trigger + reshoot +
+  brightness toggles also load from the lock-free `/api/trigger`, so the UI shows
+  their real state even while the camera is busy.
 - **Camera lock diagnostics**: `cam_lock` records its holder + hold time; a
   "busy" response says *what* holds it and for *how long* (e.g. `busy: sensor
   capture (12.3s)`), and `/api/diag` shows `camera_lock`. gphoto2 op timeouts are
@@ -409,6 +497,18 @@ Notes / gotchas learned:
   validate/rollback, and a lock-wait to kill spurious "camera busy". Exposure:
   ISO 100 / f8 / **1/30** gave a good slide off the light pad (1/60 was ~1 stop
   dark). Self-update validated on hardware (v0.1.4→…→v0.1.10 via the button).
+- [DONE 2026-08-06] **Digital brightness correction** (`brightness.py`) — the
+  answer to "a ton of slides, can't re-dial the backlight per shot". A flagged
+  frame is gamma-corrected onto a target on a background worker (no extra shot,
+  no shutter wear), bounded to ±1.5 EV, with the untouched original kept in
+  `captures/originals/` and a Review compare/undo. Verified end-to-end on real
+  400D captures on the dev host: a 1.7-stop-under frame (mean 33) lands at mean
+  90 = "ok", full-image luma confirms the PIXELS moved (33.4 → 88.8, not just
+  the thumbnail), EXIF + MakerNotes + corrected thumbnail survive, resolution
+  and 4:2:2 sampling preserved, revert restores byte-identically, and the no-PIL
+  host degrades to a visible no-op. **Not yet run on the Pi** — needs
+  `sudo apt install python3-pil` there (self-update doesn't install packages),
+  and the per-frame CPU cost on a Zero W is still to be measured.
 - [TODO] Exposure/quality polish: tighter framing to drop the black mount
   border (more resolution + accurate metering), optional custom WB off the
   light pad (slides read slightly blue). Remove the temporary `/api/debugcapture`.

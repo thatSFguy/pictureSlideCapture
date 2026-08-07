@@ -26,6 +26,9 @@ EOS 400D / Rebel XTi), so the workflow is shoot → review, optimized for volume
 - Linux host (dev machine now; a Raspberry Pi later). macOS works too.
 - [`gphoto2`](http://gphoto.org/) — `sudo apt install gphoto2`
 - Python 3 (standard library only — **nothing to `pip install`**)
+- Optional: `python3-pil` (`sudo apt install python3-pil`) for automatic
+  brightness correction; without it that feature reports itself unavailable and
+  everything else runs unchanged.
 - Optional: `exiftool` (`sudo apt install libimage-exiftool-perl`) for full EXIF
   metadata; without it the app writes a JPEG comment instead.
 - A Canon DSLR supported by gphoto2. On the 400D: set **Communication → PC
@@ -85,6 +88,35 @@ flashed image.) Requires the Pi to have internet access.
 | `[` / `]` | Go to Setup / Review |
 | `Esc` | Close the Review lightbox |
 | `Delete` | Delete (Review lightbox) |
+
+## Brightness correction
+
+Slide density varies a lot, and you can't re-dial the light pad for every frame.
+Two independent fixes, both automatic — use either or both:
+
+| | Auto-reshoot (optical) | Brightness correction (digital) |
+|---|---|---|
+| How | Steps the shutter and re-fires the **same** slide, keeping the best | Re-encodes the saved JPEG with a gamma curve onto a target brightness |
+| Cost | A whole extra capture cycle (~18 s) + shutter actuation | A few seconds of CPU, in the background — the capture loop never waits |
+| Best at | Blown highlights, very dense slides | The routine ±1–2 stop misses |
+| Limits | Slow; needs a gap before the next slide | Can't recover detail that was already clipped |
+
+Both live in **Setup**. Brightness correction is on by default for *flagged*
+frames only (switch it to "every frame" for an even-looking batch), is bounded
+to ±1.5 stops so a legitimately dark night shot can't be wrecked, and keeps the
+untouched capture in `captures/originals/` — Review's lightbox has **👁 Original**
+to compare and **↩ Undo brighten** to put it back. RAW files are never modified;
+for negatives the CR2 is the deliverable and inversion happens in post.
+
+The download-all zip carries those untouched copies in an `originals/` folder, so
+downloading and then clearing the group never bakes a correction in permanently.
+(Add `?originals=0` to the zip URL to skip them.)
+
+Brightness correction needs one system package (`python3-pil`) that the code
+update can't carry — it's a compiled library, not Python source. **You don't
+need SSH or a re-flash for it:** if it's missing, Setup shows
+**⬇ Install brightness support**, and the scanner fetches it itself over WiFi in
+a minute or two (no restart). New SD-card images ship with it already.
 
 ## Recommended camera settings
 
@@ -157,13 +189,15 @@ On older **v1** it's `gpioget gpiochip0 24` / `gpiomon --falling-edge gpiochip0 
 | `capture_server.py` | The web app (HTTP server + embedded UI + all endpoints) |
 | `camera.py` | gphoto2 wrapper: detect, get/set config, capture, retries |
 | `jpegstats.py` | Pure-stdlib JPEG brightness reader for the exposure aid |
+| `brightness.py` | Digital brightness correction: gamma-curves a flagged frame onto a target, keeps the original (needs `python3-pil`) |
 | `advance.py` | Auto slide-advance output (stub): capture → advance → repeat, settings-driven (motor+switch / stepper); default off |
 | `trigger.py` | Optical-sensor capture trigger: auto-captures on the beam-blocked edge, polarity configurable; default off |
 | `scanner.py` | Gantry dead-reckoning batch loop (deferred automation phase) |
 | `CLAUDE.md` | Detailed hardware, protocol, and development notes |
 
-Captured images and per-group sidecars (`captions.json`, `exposure.json`) are
-written under `captures/` and are git-ignored.
+Captured images and per-group sidecars (`captions.json`, `exposure.json`,
+`config.json`) are written under `captures/` and are git-ignored, as is
+`captures/originals/` (pre-correction copies).
 
 ## Post-processing
 
