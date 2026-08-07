@@ -62,16 +62,38 @@ class BrightnessError(Exception):
     pass
 
 
+_import_error = "not attempted"
+
+
 def available() -> bool:
-    """True if the image library needed to correct pixels is installed."""
+    """True if the image library needed to correct pixels is installed.
+
+    Catches Exception, not just ImportError: an INSTALLED-but-broken Pillow (a
+    C extension that can't find libjpeg, an arch/ABI mismatch) raises other
+    types, and this is called from every status poll — letting that escape would
+    500 the whole status endpoint over an optional feature. The reason is kept
+    for import_error(), because "installed but won't load" and "not installed"
+    look identical from the outside and need completely different fixes."""
+    global _import_error
     try:
         import PIL.Image  # noqa: F401
+        _import_error = ""
         return True
-    except ImportError:
+    except Exception as e:
+        _import_error = f"{type(e).__name__}: {e}"
         return False
 
 
+def import_error() -> str:
+    """Why the last available() check failed ('' if it succeeded)."""
+    return _import_error
+
+
 def unavailable_reason() -> str:
+    available()                      # refresh _import_error
+    if _import_error and "No module named" not in _import_error:
+        return (f"Pillow is installed but will not load ({_import_error}) — "
+                "brightness correction is off.")
     return ("Pillow (python3-pil) is not installed — brightness correction is "
             "off. Install it with: sudo apt install python3-pil")
 

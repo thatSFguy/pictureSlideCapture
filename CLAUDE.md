@@ -202,9 +202,19 @@ Files (all in repo root; stdlib only, with one OPTIONAL apt dependency —
     shell and no sudo (self-update ships code, not apt packages). Runs
     `sudo -n apt-get update && apt-get install -y <pkgs>` on a background thread
     (minutes on a Pi Zero W — way past any browser timeout), so POST starts it
-    and the UI polls GET for `running`/`elapsed`/`log`/`success`. No restart
-    needed: `importlib.invalidate_caches()` then re-verify. Refuses to start
-    while the camera lock is held so it can't steal CPU mid-batch.
+    and the UI polls GET for `running`/`elapsed`/`log`/`success`. Refuses to
+    start while the camera lock is held so it can't steal CPU mid-batch.
+    **`importlib.invalidate_caches()` is NOT enough** (v0.1.31 shipped assuming
+    it was, and the install failed on hardware with apt reporting
+    *"python3-pil is already the newest version"* while the running process
+    still couldn't import it): a package that appears after interpreter startup
+    isn't reliably picked up, so the service must restart. The installer decides
+    which case it's in instead of restarting blindly — it asks a **fresh
+    interpreter** (`_fresh_import_ok`, `sys.executable -c "import PIL.Image"`):
+    fresh-import OK → only this process is stale → take `cam_lock` and restart
+    (UI polls for it to come back); fresh-import ALSO fails → the library itself
+    is broken (missing shared lib, ABI mismatch) → a restart would change
+    nothing, so report the child's real error instead.
     **Security:** the request names a *feature* from the fixed `APT_FEATURES`
     table (`brightness` → `python3-pil`); no client string ever reaches the apt
     command line. When the sudoers NOPASSWD:ALL → allowlist hardening lands,
@@ -213,6 +223,14 @@ Files (all in repo root; stdlib only, with one OPTIONAL apt dependency —
     request-level `ok`, so a started install replied `{"ok": null}`), and the
     status snapshot helper must not re-take `_install_lock` (a second install
     request — double-tap, or a second tab — deadlocked that request thread).
+    **Installer output goes to the JOURNAL as well as the UI** (`[install]`
+    prefix). v0.1.31 kept it in memory only, so the one artifact an operator can
+    export — `journalctl` via *View logs* — showed a bare `FAILED` with no apt
+    output, and the real cause was unreachable without a shell the appliance
+    doesn't have. Anything that can fail on the appliance must log to the
+    journal.
+  - The appliance is on Debian **trixie** (Pi OS Lite arm64), not bookworm;
+    `python3-pil` there is Pillow 11.1.0. Don't assume bookworm package versions.
   - `GET /api/version` — current app version (`git describe`)
   - `GET /api/update` — check origin for a newer release tag; `POST /api/update`
     — check out the latest tag + restart the service (in-app self-update; git +
@@ -388,6 +406,11 @@ Features:
   (see `jpegstats.py`), shown on capture and cached per file in `exposure.json`
   so Review flags the whole batch with no recompute. Heuristic; a guide, not a
   meter (less reliable on the orange mask of negatives).
+- **UI rule learned the hard way:** never `disabled` a checkbox that defaults to
+  CHECKED. The brightness toggle was disabled while the library was missing,
+  which left the operator looking at a ticked control they couldn't untick —
+  reading as "this is running and I can't stop it" when in fact nothing was
+  being changed. Keep the control live; explain state in the note.
 - **Brightness correction** (Setup → Brightness correction; see `brightness.py`):
   after each capture, a flagged frame is queued for a gamma correction onto the
   target. Runs on a **single background worker thread, NOT in the capture path**

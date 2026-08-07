@@ -27,6 +27,7 @@ import json
 import os
 import queue
 import re
+import sys
 import shutil
 import subprocess
 import tempfile
@@ -146,8 +147,10 @@ def set_brightness(cfg: dict) -> dict:
 
 def public_brightness() -> dict:
     """Brightness config plus what the UI needs to explain itself."""
-    return {**BRIGHTNESS, "available": brightness.available(),
+    ok = brightness.available()
+    return {**BRIGHTNESS, "available": ok,
             "describe": brightness.describe(BRIGHTNESS),
+            "import_error": "" if ok else brightness.import_error(),
             "pending": _bright_q.qsize()}
 
 
@@ -1050,14 +1053,16 @@ def _restart_service() -> None:
 APT_FEATURES = {
     "brightness": {"packages": ["python3-pil"],
                    "label": "brightness correction",
-                   "verify": brightness.available},
+                   "verify": brightness.available,
+                   "why": brightness.import_error,
+                   "import": "PIL.Image"},
 }
 
 # NOTE: the install RESULT is "success", not "ok" — every JSON response here
 # already uses "ok" for "the request itself worked", and merging the two
 # silently overwrote it (a started install replied {"ok": null}).
 _install = {"running": False, "feature": None, "success": None, "log": "",
-            "started": 0.0}
+            "started": 0.0, "restarting": False}
 _install_lock = threading.Lock()
 
 
@@ -1075,16 +1080,39 @@ def install_status() -> dict:
         return _status_from(_install)
 
 
-def _log_install(text: str) -> None:
+def _log_install(text: str, journal: bool = True) -> None:
+    """Record installer output for the UI AND (by default) the journal.
+
+    The journal is the only diagnostic an operator can actually export from a
+    sealed box — an in-memory-only log dies with the process and is invisible to
+    "View logs", which is where anyone debugging a failed install will look."""
     with _install_lock:
         _install["log"] += text
+    if journal:
+        for line in text.strip().splitlines():
+            if line.strip():
+                print(f"[install] {line}", flush=True)
+
+
+def _fresh_import_ok(module: str) -> tuple[bool, str]:
+    """Can a BRAND-NEW interpreter import `module`? Decides whether a failed
+    in-process import means "we're stale, restart" or "the library is broken"."""
+    try:
+        r = subprocess.run([sys.executable, "-c", f"import {module}"],
+                           capture_output=True, text=True, timeout=120)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return False, str(e)
+    if r.returncode == 0:
+        return True, ""
+    lines = (r.stderr or "").strip().splitlines()
+    return False, (lines[-1] if lines else f"exited {r.returncode}")
 
 
 def _install_worker(feature: str, spec: dict) -> None:
     """apt-get update + install, then re-check. Runs off the request thread:
     on a Pi Zero W over WiFi this is minutes, far past any browser timeout, so
     the UI starts it and polls GET /api/install instead of waiting."""
-    ok = False
+    ok = restarting = False
     try:
         for label, cmd, timeout in (
                 ("Refreshing the package list",
@@ -1109,11 +1137,38 @@ def _install_worker(feature: str, spec: dict) -> None:
         import importlib
         importlib.invalidate_caches()
         ok = bool(spec["verify"]())
-        _log_install(f"\n=== {'Installed and working' if ok else 'Installed, but '
-                     'still not importable — restart the app'} ===\n")
+        if ok:
+            _log_install("\n=== Installed and working ===\n")
+        else:
+            # apt said yes but THIS process still can't import it. Two very
+            # different causes, so ask a FRESH interpreter to decide rather than
+            # guessing: if a new process imports it fine, only our long-running
+            # one is stale (invalidate_caches() does not reliably pick up a
+            # package that appeared after startup) and a restart fixes it. If a
+            # fresh process fails too, the library itself is broken (missing
+            # shared lib, ABI mismatch) and restarting would change nothing.
+            why = spec.get("why", lambda: "")() or "reason unknown"
+            fresh_ok, fresh_err = _fresh_import_ok(spec["import"])
+            if not fresh_ok:
+                _log_install(f"\n=== apt succeeded but the library will not load "
+                             f"in a fresh process either — restarting will not "
+                             f"help. In-process: {why}. Fresh: {fresh_err} ===\n")
+            elif _lock_acquire("install restart", 30):
+                _log_install("\n=== Installed. A fresh process imports it fine, "
+                             "so this one is just stale — restarting now ===\n")
+                ok, restarting = True, True
+                threading.Timer(1.5, _restart_service).start()
+            else:
+                _log_install(f"\n=== Installed and working, but a capture is in "
+                             f"progress so the restart that activates it was "
+                             f"skipped — restart when the batch finishes "
+                             f"(busy: {lock_status()}) ===\n")
+    except Exception as e:                      # never die silently in a thread
+        _log_install(f"\n=== installer crashed: {type(e).__name__}: {e} ===\n")
     finally:
         with _install_lock:
             _install["running"], _install["success"] = False, ok
+            _install["restarting"] = restarting
         print(f"[install] {feature}: {'ok' if ok else 'FAILED'}", flush=True)
 
 
@@ -1132,7 +1187,7 @@ def start_install(feature: str) -> dict:
             return {"ok": True, **_status_from(_install)}
         _install.update({"running": True, "feature": feature, "success": None,
                          "log": f"Installing {spec['label']}…\n",
-                         "started": time.monotonic()})
+                         "started": time.monotonic(), "restarting": False})
         started = _status_from(_install)
     threading.Thread(target=_install_worker, args=(feature, spec),
                      name="install", daemon=True).start()
@@ -1170,6 +1225,12 @@ def read_diag() -> dict:
          "advance_mode": ADVANCE.get("mode"),
          "trigger": public_trigger(), "reshoot": dict(RESHOOT),
          "brightness": public_brightness(), "camera_lock": lock_status()}
+    try:                                        # a full card fails apt AND captures
+        du = shutil.disk_usage(OUT_DIR)
+        d["disk"] = {"free_mb": du.free // 1048576, "total_mb": du.total // 1048576,
+                     "used_pct": round(100 * (du.total - du.free) / du.total)}
+    except OSError:
+        d["disk"] = None
     try:
         d["gphoto2"] = (subprocess.run(["gphoto2", "--version"],
                         capture_output=True, text=True, timeout=10)
@@ -2061,14 +2122,19 @@ function fillBright(b){ if(!b) return;
   set('#brMode', b.mode||'flagged');
   set('#brTarget', String(b.target||110));
   set('#brMaxEv', String(b.max_ev||1.5));
-  $('#brOn').disabled = !b.available;
+  // NEVER disable this box. It defaults to checked, so disabling it when the
+  // library is missing left the operator staring at a ticked control they
+  // could not untick — reading as "this is on and I can't stop it". The
+  // toggle always works; availability is explained in the note instead.
+  $('#brOn').disabled = false;
   // The appliance has no shell, so offer to install the missing piece in place
   // rather than telling the operator to run apt (they can't).
   $('#brInstall').style.display = b.available ? 'none' : 'inline-block';
   if(!b.available && !installing) $('#brMsg').textContent =
-    'Needs one extra system package (python3-pil) that isn’t on this machine yet. '
-    + 'Tap “Install brightness support” — the scanner fetches it itself, about a '
-    + 'minute on WiFi. No restart, nothing to plug in.';
+    'Inactive — no images are being changed. It needs one extra system package '
+    + '(python3-pil). Tap “Install brightness support”; the scanner fetches it '
+    + 'itself and restarts if needed, about a minute on WiFi.'
+    + (b.import_error?(' (' + b.import_error + ')'):'');
   else if(installing) { /* the installer owns the message while it runs */ }
   else if(b.pending) $('#brMsg').textContent = b.pending+' frame'+(b.pending===1?'':'s')
     +' still being corrected in the background…';
@@ -2076,6 +2142,24 @@ function fillBright(b){ if(!b) return;
 }
 /* ---- in-app install of the optional native dependency ---- */
 let installing=false;
+function waitForRestart(){
+  let tries=0;
+  const iv=setInterval(async()=>{
+    tries++;
+    try{ const d=await jget('/api/brightness');
+      clearInterval(iv); fillBright(d.brightness);
+      if(d.brightness.available){ $('#brMsg').textContent=BR_NOTE;
+        toast('Brightness correction is ready','ok'); }
+      else $('#brMsg').textContent='Restarted, but the library still will not '
+        + 'load: '+(d.brightness.import_error||'reason unknown')
+        + '. Tap View logs under System.';
+      return;
+    }catch(e){}                                  // still down; keep waiting
+    if(tries>40){ clearInterval(iv);
+      $('#brMsg').textContent='The scanner is taking a while to come back — '
+        + 'reload this page in a moment.'; }
+  }, 1500);
+}
 async function installBrightness(){
   if(installing) return;
   const d=await jpost('/api/install',{feature:'brightness'});
@@ -2091,6 +2175,11 @@ async function installBrightness(){
       +'s) '+(s.log||'').trim().split('\n').pop().slice(0,80); return; }
     clearInterval(iv); installing=false; $('#brInstall').disabled=false;
     fillBright(s.brightness);
+    // A package that appeared after startup isn't visible to this process, so
+    // the installer restarts the service; wait for it to come back rather than
+    // leaving a dead page and a "still unavailable" message.
+    if(s.restarting){ $('#brMsg').textContent='Installed — restarting the scanner '
+      + 'to activate it…'; waitForRestart(); return; }
     if(s.success){ $('#brMsg').textContent=BR_NOTE;
       toast('Brightness correction is ready','ok'); }
     else { $('#brMsg').textContent='Install failed — tap View logs under System, '
