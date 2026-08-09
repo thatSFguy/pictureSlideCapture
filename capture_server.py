@@ -176,11 +176,25 @@ _sidecar_lock = threading.Lock()      # sidecar JSON is read-modify-write
 LAST_USB_DONE = 0.0
 # Last successful camera-side status read, reused by the background poll so it
 # never has to take the camera lock while a hands-off run is going (see
-# read_status_cached). Empty until the first successful read.
+# read_status_cached). Refreshed at startup and then piggybacked onto captures
+# (see _refresh_cam_status) — NOT left to the poll, which never runs a real read
+# while the trigger is armed and so would leave the UI stuck on "no camera".
 _CAM_STATUS: dict = {"connected": False}
-# Shoot blind if the last capture ended longer ago than this — the post-capture
-# bus drop is ~1-2s, so this is a wide margin.
-READY_PROBE_WINDOW = 20.0
+_CAM_STATUS_AT = 0.0          # monotonic time of that read (0 = never)
+# How stale the cached camera fields may get during a hands-off run. The refresh
+# rides along on a capture we are already holding the lock for, and happens
+# AFTER the shutter, so it can never delay an exposure.
+STATUS_REFRESH_S = 240.0
+# Shoot blind if the last capture ended longer ago than this. The 400D's
+# post-capture bus drop is ~1-2s, so 5s is already a generous margin, and if the
+# camera IS unexpectedly away, _grab's no-file retry still recovers.
+# This was 20s and that was far too wide: measured on the appliance
+# (2026-08-09), edges arrive ~15s apart and the previous capture ends ~5s after
+# its own edge, leaving a ~10s gap — inside the window, so the probe ran on
+# almost every frame at a cost of 1.6-2.2s. It was BOTH the single largest slice
+# of sensor-to-shutter latency and essentially all of its variance (with the
+# probe: 4.68-5.16s; the one frame that skipped it: 3.05s).
+READY_PROBE_WINDOW = 5.0
 
 
 def update_exposure(name: str, status: str | None) -> None:
@@ -821,6 +835,10 @@ def do_capture(on_shutter=None) -> dict:
     # already saved, so a failed advance is reported, not fatal.
     adv = _advance_once() if (advancer.enabled and ADVANCE.get("after_capture")) \
         else None
+    # Keep the UI's camera pill alive during a hands-off run. Cheap no-op unless
+    # the cache is stale, and always after the shutter, so it costs no latency
+    # on the frame that pays for it.
+    _refresh_cam_status()
     res = {"ok": True, "name": jpg.name, "index": n, "count": image_count(prefix),
            "raw": raw.name if raw else None, "preview_from_raw": derived,
            "exposure": stats, "advance": adv, "reshoots": reshoots,
@@ -931,6 +949,38 @@ def _group_state() -> dict:
             "brightness": public_brightness()}
 
 
+def _refresh_cam_status(force: bool = False) -> None:
+    """Top up the cached camera fields. Call ONLY with cam_lock held and only
+    after the shutter has fired, so it can never delay an exposure.
+
+    This is how the UI keeps showing a live camera during a hands-off run: the
+    background poll deliberately never touches the camera while the trigger is
+    armed, so without this the pill would sit on "no camera" for the whole batch
+    (which is exactly what it did when the poll was first made lock-free)."""
+    global _CAM_STATUS, _CAM_STATUS_AT
+    now = time.monotonic()
+    # We just used the camera, so at minimum it is present.
+    if _CAM_STATUS.get("connected") is not True:
+        _CAM_STATUS = {**_CAM_STATUS, "connected": True}
+        _CAM_STATUS.pop("error", None)
+    if not force and now - _CAM_STATUS_AT < STATUS_REFRESH_S:
+        return
+    try:
+        v = cam.get_many(["batterylevel", "autoexposuremode", "availableshots",
+                          "iso", "aperture", "shutterspeed", "imageformat"])
+    except CameraError:
+        return                                     # keep the last good values
+    mode = v.get("autoexposuremode", "?")
+    _CAM_STATUS = {
+        "connected": True, "model": _CAM_STATUS.get("model", "camera"),
+        "battery": v.get("batterylevel", "?"), "mode": mode,
+        "manual": mode.lower() == "manual", "shots": v.get("availableshots", "?"),
+        "iso": v.get("iso", "?"), "aperture": v.get("aperture", "?"),
+        "shutter": v.get("shutterspeed", "?"), "format": v.get("imageformat", "?"),
+    }
+    _CAM_STATUS_AT = now
+
+
 def read_status_cached() -> dict:
     """Status with the camera fields served from the last successful read.
 
@@ -941,12 +991,14 @@ def read_status_cached() -> dict:
     the journal, because the trigger logs "capturing" BEFORE it waits for the
     lock. The camera fields (battery, mode, shot count, exposure settings) barely
     change during a run, so a cached copy costs the operator nothing."""
-    return {**_CAM_STATUS, **_group_state(), "cached": True}
+    age = (time.monotonic() - _CAM_STATUS_AT) if _CAM_STATUS_AT else None
+    return {**_CAM_STATUS, **_group_state(), "cached": True,
+            "cached_age_s": None if age is None else round(age)}
 
 
 def read_status() -> dict:
     """Light status: one batched gphoto2 call. Assumes cam_lock held."""
-    global _CAM_STATUS
+    global _CAM_STATUS, _CAM_STATUS_AT
     try:
         model = cam.model()
         v = cam.get_many(["batterylevel", "autoexposuremode", "availableshots",
@@ -962,6 +1014,7 @@ def read_status() -> dict:
         "iso": v.get("iso", "?"), "aperture": v.get("aperture", "?"),
         "shutter": v.get("shutterspeed", "?"), "format": v.get("imageformat", "?"),
     }
+    _CAM_STATUS_AT = time.monotonic()
     return {**_CAM_STATUS, **_group_state()}
 
 
@@ -1388,6 +1441,19 @@ def debug_capture() -> dict:
 
 
 # ---- HTTP handler ---------------------------------------------------------
+
+class QuietServer(ThreadingHTTPServer):
+    """ThreadingHTTPServer that doesn't dump a traceback when a client hangs up
+    mid-response. A phone locking its screen or a tab closing during a poll is
+    routine, but stock socketserver logs ~30 lines of BrokenPipeError for each
+    one — and the journal is the operator's ONLY diagnostic on this appliance, so
+    filling it with noise actively costs us. Real errors still print."""
+
+    def handle_error(self, request, client_address):
+        if isinstance(sys.exc_info()[1], (BrokenPipeError, ConnectionResetError)):
+            return
+        super().handle_error(request, client_address)
+
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):
@@ -2570,6 +2636,20 @@ def main():
         except AdvanceError as e:
             print(f"  saved advance config rejected ({e})")
 
+    # Seed the camera-status cache BEFORE the trigger is armed, so the UI has
+    # real values from the first page load. Once the trigger is running the
+    # background poll deliberately never touches the camera, and the only other
+    # refresh rides on a capture — so without this the pill would read "no
+    # camera" until the first frame. Best effort: a camera that is off simply
+    # leaves the cache empty, exactly as before.
+    if _lock_acquire("startup status", 5):
+        try:
+            read_status()
+        except CameraError as e:
+            print(f"  camera not readable at startup ({friendly(str(e))})")
+        finally:
+            _lock_release()
+
     # Optical-sensor capture trigger. --sensor CLI flags override the saved
     # config; otherwise restore what was saved. Build the watcher either way so
     # /api/trigger has live config; only "gpio" mode starts a thread + libgpiod.
@@ -2592,7 +2672,7 @@ def main():
                      daemon=True).start()
     print(f"Brightness:      {brightness.describe(BRIGHTNESS)}")
 
-    srv = ThreadingHTTPServer((args.host, args.port), Handler)
+    srv = QuietServer((args.host, args.port), Handler)
     print(f"\nServing at http://{args.host}:{args.port}  (Ctrl-C to stop)")
     try:
         srv.serve_forever()

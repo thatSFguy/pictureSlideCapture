@@ -524,6 +524,26 @@ two gphoto2 sessions — a plausible source of exactly the "usually 10-11 o'cloc
 occasionally past 9" variance. It now serves cached camera fields
 (`read_status_cached`) whenever the sensor trigger is armed, and never touches
 the camera.
+**That lock-free poll needs a cache feeder, or the UI goes blind.** First cut
+shipped without one and the camera pill read "no camera" for a whole batch:
+nothing else ever called `read_status`. The cache is now seeded at startup
+(before the trigger is armed) and topped up by `_refresh_cam_status()`, which
+rides on a capture whose lock we already hold and runs **after the shutter**, so
+it can never delay an exposure. `STATUS_REFRESH_S`=240s.
+
+**Measured breakdown (appliance, v0.1.33, 12 sensor frames, 2026-08-09):**
+edge→shutter mean **4.71s** (3.05–5.16). Of that, `probe` was 1.62s mean and the
+shutter then fired a very consistent **3.09s** into `_grab` (2.96–3.30) — that is
+gphoto2 startup + PTP session open + the exposure. The download *after* the
+shutter is only **0.46s**, confirming the whole post-shutter half is irrelevant
+to the race. `[post] meta=` measured 2.2–2.8s, i.e. exiftool really was that
+expensive; moving it off the capture path was worth it.
+
+The probe was the entire story: it ran on nearly every frame (see
+`READY_PROBE_WINDOW`) and was both the biggest single slice AND essentially all
+the variance. With it: 4.68–5.16s. The one frame that skipped it: 3.05s.
+**Remaining target is that ~3.1s of gphoto2 setup + exposure**, which only a
+persistent session can attack.
 
 Other costs taken off the pre-shutter path:
 - `capturetarget` is sent **once per session**, not before every shutter — it was
