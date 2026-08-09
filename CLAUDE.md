@@ -560,15 +560,52 @@ Full per-frame breakdown in the journal:
 session, `shot` = `_grab` incl. download, `meter` = jpegstats, `tail` =
 planning/queueing), plus `[post] <name>: meta=… total=… (queue N)`.
 
-**If more is needed, the big lever is a persistent gphoto2 session** (`--shell`,
-or python-gphoto2) instead of one subprocess per operation, so process spawn +
-USB claim + PTP session open stop sitting in front of every exposure. It fights
-`camera.py`'s retry-on-re-enumeration design (a fresh process re-detects the
-device for free, which is what makes the retry work), so it needs a fallback that
-respawns the session. Measure `SHUTTER at +…` first — if the pre-shutter time is
-dominated by that setup, this is worth the complexity.
 **A hardware option costs nothing in software:** moving the sensor so it trips
 EARLIER in the revolution buys margin directly, without slowing the motor.
+
+### Persistent gphoto2 session (`ShellSession` in camera.py)
+The answer to that ~3.1s: `gphoto2 --shell` keeps the PTP session open and takes
+commands on stdin, so process start + camlib scan + USB claim + PTP OpenSession
+are paid ONCE per run instead of before every exposure. Enabled by default;
+`--no-persist` reverts to a process per operation.
+
+Things that are load-bearing, and were each a bug or a near-miss first:
+- **Synchronise with a sentinel, not the prompt.** The shell's prompt goes
+  through readline, which may not print it at all when stdin is a pipe. Each
+  command is followed by a unique BOGUS command; the shell answers
+  `Command '<marker>' not found.` unconditionally, which is a reliable
+  end-of-output marker. (`_SHELL_SENTINEL`.)
+- **Read raw bytes, not lines.** The shell's final output before it waits for
+  input has no trailing newline, so a `readline()` loop blocks with data unread.
+- **One process may claim the camera at a time.** Everything must go through the
+  session; `Camera._run` translates the CLI arg list to shell commands and, for
+  anything it can't express (`--auto-detect`), CLOSES the session first. `model()`
+  is cached for exactly this reason — an uncached call would tear the session
+  down just to re-read a constant.
+- **`cwd` matters only for captures** (gphoto2 stages downloads there). Config
+  ops pass `cwd=None` = "any live session will do". Demanding a match made every
+  settings read rebuild the session (~3s) and quietly undid the whole feature.
+- **Re-root the session at the output dir before anything opens one**
+  (`set_capture_dir`, called from `main()`), or the startup status read opens it
+  at the process cwd and the FIRST CAPTURE — a real slide — pays the restart.
+- **Reopen eagerly** (`_rewarm_shell`) after an op that had to close it, so the
+  ~3s lands on that op and not on the next exposure.
+- **The `--filename` pattern is fixed when the shell launches**, so captures land
+  on `SHELL_CAPTURE_STEM` and are renamed onto the caller's name afterwards
+  (`_promote_shell_files`); a no-op after a legacy run, so callers never need to
+  know which path ran.
+- **It self-disables.** Any session error falls back to a fresh process for that
+  frame (never losing it) and after `_SHELL_MAX_FAILS`=3 consecutive failures the
+  feature is switched off for the run — retrying a doomed session forever would
+  be SLOWER than never trying (a wasted attempt plus the legacy run).
+
+**UNVERIFIED ON HARDWARE:** whether the 400D's post-capture USB re-enumeration
+kills a held session. If it does, the journal will show `[camera] persistent
+session failed …` per frame and then the give-up message, and throughput returns
+to the v0.1.34 baseline — no frames lost either way. Check
+`/api/diag → persistent_session` (`shell` vs `legacy` vs `fallbacks` counts) after
+a run. Against the stub the win is the full ~3s: first frame 3.34s to shutter,
+every one after it 0.30s.
 
 Run (dev host):
     python3 capture_server.py            # http://localhost:8080

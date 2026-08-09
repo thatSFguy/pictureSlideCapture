@@ -12,10 +12,16 @@ Design notes (confirmed on hardware — see CLAUDE.md):
 
 from __future__ import annotations
 
+import os
 import subprocess
 import threading
 import time
 from pathlib import Path
+
+# The persistent session's --filename is fixed when it launches, so shell
+# captures all land on this stem and are renamed onto the real one afterwards.
+# Leading underscore keeps it out of the group globs, which match "<prefix>_NNNN".
+SHELL_CAPTURE_STEM = "_gpshell"
 
 
 # Substrings that indicate a transient USB re-enumeration / claim / device-busy
@@ -34,16 +40,277 @@ class CameraError(RuntimeError):
     pass
 
 
+# ---- persistent gphoto2 shell session -------------------------------------
+# Spawning a gphoto2 process per operation costs ~3.1s on a Pi Zero W before the
+# shutter even moves (measured: process start + libgphoto2 camlib scan + USB
+# claim + PTP OpenSession). On a rig whose slide pusher keeps rotating, that is
+# the throughput limit. `gphoto2 --shell` pays it ONCE and then takes commands on
+# stdin with the PTP session already open.
+#
+# Synchronising with it needs care. The shell's prompt goes through readline,
+# which may not print it at all when stdin is a pipe, so the prompt is NOT a safe
+# end-of-output marker. Instead each command is followed by a unique BOGUS
+# command; the shell answers with "Command '<marker>' not found." and carries on.
+# That string is emitted unconditionally, so it is a reliable sentinel.
+_SHELL_SENTINEL = "Command '{}' not found"
+
+# Consecutive shell failures before giving up on it for the rest of the run.
+# Falling back per-capture is fine; silently retrying a broken session forever
+# would be SLOWER than never having tried (a doomed attempt plus the legacy run).
+_SHELL_MAX_FAILS = 3
+
+
+class ShellSession:
+    """A long-lived `gphoto2 --shell` holding the camera's PTP session open.
+
+    Only one process can claim the camera at a time, so while this is alive
+    every camera operation must go through it (Camera._run enforces that by
+    closing the session before any command it cannot translate)."""
+
+    def __init__(self, cwd: str, filename: str, log=None):
+        self.cwd = cwd
+        self.filename = filename
+        self._log = log or (lambda m: None)
+        self._proc: subprocess.Popen | None = None
+        self._buf = ""
+        self._cond = threading.Condition()
+        self._eof = False
+        self._seq = 0
+        self._reader: threading.Thread | None = None
+
+    # -- lifecycle ----------------------------------------------------------
+    def start(self, timeout: float = 30.0) -> None:
+        """Spawn the shell and block until it answers, i.e. the camera is
+        claimed and the PTP session is open. Raises CameraError if it won't."""
+        argv = ["gphoto2", "--filename", self.filename, "--force-overwrite",
+                "--shell"]
+        try:
+            self._proc = subprocess.Popen(
+                argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT, cwd=self.cwd, bufsize=0)
+        except OSError as e:
+            raise CameraError(f"cannot start gphoto2 shell: {e}")
+        self._reader = threading.Thread(target=self._pump, daemon=True,
+                                        name="gphoto2-shell")
+        self._reader.start()
+        # A no-op round trip proves the session is up (and swallows the banner).
+        self.run([], timeout=timeout)
+        self._log("[camera] persistent gphoto2 session open")
+
+    def _pump(self) -> None:
+        """Drain stdout into the buffer. Reads raw bytes rather than lines: the
+        shell's last output before it waits for input has no trailing newline,
+        so a readline() loop would block with data still unseen."""
+        fd = self._proc.stdout
+        while True:
+            try:
+                chunk = fd.read(4096)
+            except (OSError, ValueError):
+                chunk = b""
+            if not chunk:
+                with self._cond:
+                    self._eof = True
+                    self._cond.notify_all()
+                return
+            with self._cond:
+                self._buf += chunk.decode("utf-8", "replace")
+                self._cond.notify_all()
+
+    def alive(self) -> bool:
+        return (self._proc is not None and self._proc.poll() is None
+                and not self._eof)
+
+    def close(self) -> None:
+        p, self._proc = self._proc, None
+        if p is None:
+            return
+        try:
+            if p.poll() is None:
+                try:
+                    p.stdin.write(b"quit\n")
+                    p.stdin.flush()
+                except (OSError, ValueError):
+                    pass
+                try:
+                    p.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    p.kill()
+                    p.wait(timeout=3)
+        finally:
+            for s in (p.stdin, p.stdout):
+                try:
+                    s.close()
+                except Exception:
+                    pass
+
+    # -- command ------------------------------------------------------------
+    def run(self, cmds: list[str], timeout: float = 25.0, on_event=None,
+            markers: tuple = ()) -> str:
+        """Send commands and return everything the shell printed for them.
+
+        `on_event` fires the moment any of `markers` appears in the output —
+        used to report the shutter without waiting for the download."""
+        if self._proc is None or self._proc.poll() is not None:
+            raise CameraError("gphoto2 shell is not running")
+        self._seq += 1
+        marker = f"__sync{self._seq}__"
+        sentinel = _SHELL_SENTINEL.format(marker)
+        with self._cond:
+            self._buf = ""
+        payload = "".join(c + "\n" for c in cmds) + marker + "\n"
+        try:
+            self._proc.stdin.write(payload.encode())
+            self._proc.stdin.flush()
+        except (OSError, ValueError) as e:
+            raise CameraError(f"gphoto2 shell died: {e}")
+
+        fired, deadline = False, time.monotonic() + timeout
+        while True:
+            with self._cond:
+                buf = self._buf
+                if sentinel not in buf:
+                    if self._eof:
+                        raise CameraError("gphoto2 shell exited unexpectedly")
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise CameraError(f"gphoto2 shell timeout after {timeout}s")
+                    self._cond.wait(min(0.2, remaining))
+            if not fired and markers and on_event and \
+                    any(m in buf.lower() for m in markers):
+                fired = True
+                try:
+                    on_event()
+                except Exception:      # never let a callback break a capture
+                    pass
+            if sentinel in buf:
+                return buf.split(sentinel)[0]
+
+
 class Camera:
     """Controls the DSLR via the gphoto2 CLI, one subprocess per operation."""
 
     def __init__(self, retries: int = 4, backoff: float = 1.5,
-                 verbose: bool = True):
+                 verbose: bool = True, persistent: bool = True):
         self.retries = retries
         self.backoff = backoff
         self.verbose = verbose
         self.last_stdout = ""     # gphoto2 output of the most recent success
         self._target_set = None   # capturetarget already sent this session
+        # Persistent session (see ShellSession). Kept optional and self-
+        # disabling: it is a large win when it works, but if this camera can't
+        # hold a session across captures every attempt is wasted time, so
+        # repeated failures switch it off rather than pay that cost forever.
+        self.persistent = persistent
+        self._shell: ShellSession | None = None
+        self._shell_fails = 0
+        self._shell_off = False   # gave up on it for this run
+        self._last_shell_cwd = None
+        self._model_cache = ""
+        self.shell_stats = {"shell": 0, "legacy": 0, "fallbacks": 0}
+
+    # -- persistent session management --------------------------------------
+    def _shell_usable(self) -> bool:
+        return self.persistent and not self._shell_off
+
+    def _ensure_shell(self, cwd: str | None) -> ShellSession | None:
+        """Return a live session, starting one if needed. Returns None (and
+        disables the feature after repeated failures) if it can't be established.
+
+        `cwd` is where downloads must land, and only a capture cares: gphoto2
+        stages downloads in its working directory. Config reads and writes pass
+        None, meaning "any live session will do" — an earlier version demanded a
+        match and so tore the session down and rebuilt it (~3s) on every settings
+        read, which quietly undid the whole point."""
+        if not self._shell_usable():
+            return None
+        if self._shell is not None and self._shell.alive() \
+                and (cwd is None or self._shell.cwd == cwd):
+            return self._shell
+        cwd = cwd or self._last_shell_cwd or os.getcwd()
+        self._last_shell_cwd = cwd
+        self._close_shell()
+        sh = ShellSession(cwd, SHELL_CAPTURE_STEM + ".%C",
+                          log=self._say)
+        try:
+            sh.start()
+        except CameraError as e:
+            self._note_shell_failure(f"could not open session: {e}")
+            return None
+        self._shell = sh
+        self._shell_fails = 0
+        return sh
+
+    def _close_shell(self) -> None:
+        if self._shell is not None:
+            self._shell.close()
+            self._shell = None
+
+    def _note_shell_failure(self, why: str) -> None:
+        self._close_shell()
+        self._shell_fails += 1
+        self.shell_stats["fallbacks"] += 1
+        self._say(f"[camera] persistent session failed ({why}) — using a fresh "
+                  f"process for this one [{self._shell_fails}/{_SHELL_MAX_FAILS}]")
+        if self._shell_fails >= _SHELL_MAX_FAILS:
+            self._shell_off = True
+            self._say("[camera] giving up on the persistent gphoto2 session for "
+                      "this run; every capture will spawn its own process "
+                      "(slower, but reliable). Restart the service to retry.")
+
+    def set_capture_dir(self, folder) -> None:
+        """Tell the camera where captures will land, before anything opens a
+        session. Without this the first session gets rooted at the process's cwd
+        (whatever a startup status read happened to use) and the FIRST CAPTURE
+        pays a ~3s restart to re-root it — and on this rig the first capture is a
+        real slide, not a warm-up."""
+        self._last_shell_cwd = str(folder)
+
+    def shutdown(self) -> None:
+        """Release the camera. Safe to call more than once, and from a signal
+        or restart path — a session left running would keep the USB device
+        claimed against whatever starts next."""
+        self._close_shell()
+
+    def _rewarm_shell(self) -> None:
+        """Reopen the session after an operation that had to close it.
+
+        Done here, on an op nobody is racing, rather than lazily on the next
+        capture: restarting costs ~3s, and paid at capture time on this rig that
+        is a spoiled frame."""
+        if not self._shell_usable() or self._shell is not None:
+            return
+        if self._last_shell_cwd:
+            self._ensure_shell(self._last_shell_cwd)
+
+    def _say(self, msg: str) -> None:
+        if self.verbose:
+            print(msg, flush=True)
+
+    @staticmethod
+    def _shell_cmds(args: list[str]) -> list[str] | None:
+        """Translate a gphoto2 CLI arg list into shell commands, or None if it
+        contains anything the shell can't do (which forces the legacy path)."""
+        cmds: list[str] = []
+        i = 0
+        while i < len(args):
+            a = args[i]
+            if a == "--get-config":
+                cmds.append(f"get-config {args[i + 1]}")
+                i += 2
+            elif a in ("--set-config", "--set-config-value",
+                       "--set-config-index"):
+                cmds.append(f"{a[2:]} {args[i + 1]}")
+                i += 2
+            elif a == "--capture-image-and-download":
+                cmds.append("capture-image-and-download")
+                i += 1
+            elif a == "--filename":       # fixed when the session was launched
+                i += 2
+            elif a == "--force-overwrite":
+                i += 1
+            else:
+                return None               # e.g. --auto-detect: needs its own run
+        return cmds
 
     def _run(self, args: list[str], timeout: float = 25.0,
              cwd: str | None = None, on_event=None) -> str:
@@ -53,7 +320,22 @@ class Camera:
         dir, not the (root-owned) service WorkingDirectory.
 
         `on_event` switches to a line-streaming run so the caller learns the
-        shutter has fired without waiting for the download (see _run_streaming)."""
+        shutter has fired without waiting for the download (see _run_streaming).
+
+        Prefers the persistent session when one can serve this command; anything
+        it can't express closes the session first, because gphoto2 can only have
+        one process claiming the camera at a time."""
+        cmds = self._shell_cmds(args) if self._shell_usable() else None
+        if cmds is not None:
+            out = self._try_shell(cmds, timeout, cwd, on_event)
+            if out is not None:
+                self.shell_stats["shell"] += 1
+                self.last_stdout = out
+                return out
+        else:
+            # The legacy path needs exclusive access to the camera.
+            self._close_shell()
+
         last = ""
         for attempt in range(1, self.retries + 1):
             try:
@@ -74,6 +356,8 @@ class Camera:
             else:
                 if proc.returncode == 0:
                     self.last_stdout = proc.stdout
+                    self.shell_stats["legacy"] += 1
+                    self._rewarm_shell()
                     return proc.stdout
                 last = (proc.stderr or proc.stdout).strip()
 
@@ -91,6 +375,27 @@ class Camera:
             break
         raise CameraError(f"gphoto2 {' '.join(args)} failed: {last}")
 
+    def _try_shell(self, cmds: list[str], timeout: float, cwd: str | None,
+                   on_event) -> str | None:
+        """Run `cmds` on the persistent session. Returns its output, or None to
+        mean "fall back to a fresh process" — never raises, because a session
+        problem must not lose the frame."""
+        sh = self._ensure_shell(cwd)
+        if sh is None:
+            return None
+        try:
+            out = sh.run(cmds, timeout=timeout, on_event=on_event,
+                         markers=self._SHUTTER_MARKERS)
+        except CameraError as e:
+            self._note_shell_failure(str(e))
+            return None
+        if "*** Error" in out:
+            first = next((l for l in out.splitlines() if "*** Error" in l), "?")
+            self._note_shell_failure(first.strip())
+            return None
+        self._shell_fails = 0
+        return out
+
     # -- queries -----------------------------------------------------------
 
     def detect(self) -> str:
@@ -100,9 +405,15 @@ class Camera:
         return out.strip()
 
     def model(self) -> str:
+        # Cached: --auto-detect can't run through the persistent session, so an
+        # uncached call would tear the session down (and cost the next capture a
+        # ~3s restart) purely to re-read a string that never changes.
+        if self._model_cache:
+            return self._model_cache
         for line in self._run(["--auto-detect"]).splitlines():
             if "usb:" in line:
-                return line.rsplit("usb:", 1)[0].strip()
+                self._model_cache = line.rsplit("usb:", 1)[0].strip()
+                return self._model_cache
         return "unknown"
 
     def get_config(self, name: str) -> str:
@@ -170,7 +481,19 @@ class Camera:
     def ready(self) -> bool:
         """One quick probe: True if the camera answers a config read right now.
         Single attempt, no retry/backoff (the caller polls) — a cheap read that
-        needs no writable cwd and doesn't touch the shutter."""
+        needs no writable cwd and doesn't touch the shutter.
+
+        Goes through the persistent session when there is one: a separate
+        process could not claim the camera anyway while the session holds it.
+        A failure here is NOT counted against the session — the camera being
+        briefly absent is exactly what this is asking about."""
+        sh = self._shell
+        if sh is not None and sh.alive():
+            try:
+                out = sh.run(["get-config availableshots"], timeout=15)
+            except CameraError:
+                return False
+            return "*** Error" not in out
         try:
             proc = subprocess.run(
                 ["gphoto2", "--get-config", "availableshots"],
@@ -313,15 +636,43 @@ class Camera:
         # 30s is generous (a full RAW cycle is ~5.6s) but bounded, so a wedged
         # camera (asleep / powered off) releases the caller's lock promptly
         # instead of pinning it for the old 90s.
+        # A persistent session downloads to the stem fixed at its launch, so
+        # clear any leftover from a previous frame before firing.
+        self._wipe_shell_stem(dest.parent)
         try:
             out = self._run(args, timeout=30.0, cwd=str(dest.parent),
                             on_event=on_shutter)
         except CameraError:
             self._target_set = None                # re-send it on the next try
+            self._wipe_shell_stem(dest.parent)
             raise
         if capturetarget:
             self._target_set = capturetarget
+        self._promote_shell_files(dest)
         return out
+
+    @staticmethod
+    def _wipe_shell_stem(folder: Path) -> None:
+        for f in folder.glob(SHELL_CAPTURE_STEM + ".*"):
+            try:
+                f.unlink()
+            except OSError:
+                pass
+
+    @staticmethod
+    def _promote_shell_files(dest: Path) -> None:
+        """Move a persistent-session capture onto the caller's filename.
+
+        No-op after a legacy run, which writes straight to `dest` — so callers
+        get identical results either way and never need to know which path ran.
+        `dest` may contain gphoto2's %C extension token."""
+        for f in sorted(dest.parent.glob(SHELL_CAPTURE_STEM + ".*")):
+            ext = f.suffix.lstrip(".")
+            target = Path(str(dest).replace("%C", ext))
+            try:
+                f.replace(target)
+            except OSError:
+                pass
 
     def forget_capturetarget(self) -> None:
         """Drop the cached capturetarget so the next capture re-sends it. Call

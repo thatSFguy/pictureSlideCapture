@@ -66,6 +66,9 @@ PREFIX_BAD = re.compile(r"[^A-Za-z0-9_-]+")
 
 # ---- shared state ---------------------------------------------------------
 cam = Camera(retries=3, backoff=0.8, verbose=True)  # fail fast when camera absent
+# Persistent gphoto2 session on/off (--no-persist to disable). It removes ~3s of
+# process start + PTP setup from in front of every exposure, which is the rig's
+# throughput limit; it self-disables if this camera can't hold a session.
 cam_lock = threading.Lock()          # camera is single-session: serialize access
 _lock_info = {"who": None, "since": 0.0}   # who holds cam_lock + when they took it
 
@@ -1183,6 +1186,10 @@ def update_apply() -> dict:
 
 
 def _restart_service() -> None:
+    # Hand the camera back before systemd kills us: a persistent gphoto2 session
+    # is a child process holding the USB device, and the replacement service
+    # starts within a second or two.
+    cam.shutdown()
     subprocess.run(["sudo", "-n", "systemctl", "restart", SERVICE_NAME],
                    capture_output=True, text=True)
 
@@ -1393,6 +1400,11 @@ def read_diag() -> dict:
     except CameraError as e:
         d["camera_connected"] = False
         d["camera_error"] = friendly(str(e))
+    # Last, so it reflects the session AFTER the camera reads above rather than
+    # whatever was true before this function touched the camera.
+    d["persistent_session"] = {
+        "enabled": cam.persistent, "live": cam._shell is not None,
+        "given_up": cam._shell_off, **cam.shell_stats}
     return d
 
 
@@ -2604,7 +2616,12 @@ def main():
                    help="BCM line wired to the sensor OUT (default %(default)s = phys pin 18)")
     p.add_argument("--sensor-active-high", action="store_true",
                    help="sensor OUT goes HIGH when obstructed (default: LOW)")
+    p.add_argument("--no-persist", action="store_true",
+                   help="disable the persistent gphoto2 session (spawn a fresh "
+                        "process per operation, as before — slower, but the "
+                        "fallback if a camera can't hold a session)")
     args = p.parse_args()
+    cam.persistent = not args.no_persist
 
     OUT_DIR = Path(args.out_dir)
     OUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -2635,6 +2652,11 @@ def main():
             set_advance(saved["advance"])
         except AdvanceError as e:
             print(f"  saved advance config rejected ({e})")
+
+    # Root any persistent gphoto2 session in the output directory from the
+    # start, so the first capture inherits a usable session instead of paying to
+    # rebuild one (gphoto2 stages downloads in its working directory).
+    cam.set_capture_dir(OUT_DIR)
 
     # Seed the camera-status cache BEFORE the trigger is armed, so the UI has
     # real values from the first page load. Once the trigger is running the
@@ -2678,6 +2700,8 @@ def main():
         srv.serve_forever()
     except KeyboardInterrupt:
         print("\nStopped.")
+    finally:
+        cam.shutdown()
 
 
 if __name__ == "__main__":

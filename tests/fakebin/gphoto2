@@ -1,0 +1,120 @@
+#!/usr/bin/env python3
+"""Stand-in for gphoto2 that emulates BOTH the one-shot CLI and --shell mode,
+with the cost model measured on the Pi Zero W: process start + PTP setup is
+expensive, per-command work over an open session is cheap.
+
+Env knobs let the tests drive failure modes:
+  FS_START   seconds of startup/PTP cost                       (default 3.0)
+  FS_EXPOSE  seconds from capture command to the shutter        (default 0.1)
+  FS_DL      seconds of download after the shutter              (default 0.4)
+  FS_DIE_AFTER  shell exits after this many captures (0 = never)
+  FS_ERR_AFTER  shell reports *** Error on captures after this many (0 = never)
+  FS_NO_SHELL   '1' => --shell is unsupported (exits nonzero)
+  FS_LOG     append a line per invocation/command here
+"""
+import os, sys, time
+from pathlib import Path
+
+START = float(os.environ.get("FS_START", "3.0"))
+EXPOSE = float(os.environ.get("FS_EXPOSE", "0.1"))
+DL = float(os.environ.get("FS_DL", "0.4"))
+DIE_AFTER = int(os.environ.get("FS_DIE_AFTER", "0"))
+ERR_AFTER = int(os.environ.get("FS_ERR_AFTER", "0"))
+LOG = os.environ.get("FS_LOG")
+SRC = "/home/robw/projects/pictureSlideCapture/captures/1972_Somewhere_0001.jpg"
+
+args = sys.argv[1:]
+CONFIG = {"batterylevel": "75%", "autoexposuremode": "Manual",
+          "availableshots": "423", "iso": "100", "aperture": "8",
+          "shutterspeed": "1/30", "imageformat": "Large Fine JPEG",
+          "capturetarget": "Internal RAM"}
+
+
+def note(what):
+    if LOG:
+        with open(LOG, "a") as f:
+            f.write(what + "\n")
+
+
+def emit_config(name):
+    print("Label: %s" % name)
+    print("Current: %s" % CONFIG.get(name, "?"))
+    print("Choice: 0 %s" % CONFIG.get(name, "?"))
+
+
+def do_capture(fname):
+    time.sleep(EXPOSE)
+    print("New file is in location /capt0000.jpg on the camera", flush=True)
+    print("Saving file as %s" % fname, flush=True)
+    time.sleep(DL)
+    Path(fname).write_bytes(Path(SRC).read_bytes())
+
+
+def filename_arg(default="capt0000.%C"):
+    return args[args.index("--filename") + 1] if "--filename" in args else default
+
+
+if "--version" in args:
+    print("gphoto2 2.5.32"); sys.exit(0)
+
+if "--auto-detect" in args:
+    note("cli --auto-detect")
+    time.sleep(START)
+    print("Canon EOS 400D (PTP mode)   usb:001,004")
+    sys.exit(0)
+
+if "--shell" in args:
+    if os.environ.get("FS_NO_SHELL") == "1":
+        note("shell REFUSED")
+        sys.stderr.write("*** Error: No camera found. ***\n")
+        sys.exit(1)
+    note("shell START")
+    time.sleep(START)                       # the cost we pay exactly once
+    pattern = filename_arg("capt%04n.%C")
+    shots = 0
+    sys.stdout.write("gphoto2: {Canon EOS 400D} /> ")
+    sys.stdout.flush()
+    for line in sys.stdin:
+        cmd = line.strip()
+        if not cmd:
+            continue
+        if cmd in ("quit", "exit"):
+            break
+        note("shell: " + cmd)
+        if cmd == "capture-image-and-download":
+            shots += 1
+            if DIE_AFTER and shots > DIE_AFTER:
+                note("shell DIED")
+                sys.exit(1)                 # camera vanished mid-run
+            if ERR_AFTER and shots > ERR_AFTER:
+                print("*** Error: Could not claim the USB device ***")
+            else:
+                do_capture(pattern.replace("%C", "jpg").replace("%04n", "0000"))
+        elif cmd.startswith("get-config "):
+            emit_config(cmd.split(None, 1)[1].strip())
+        elif cmd.startswith(("set-config ", "set-config-value ",
+                             "set-config-index ")):
+            k, _, v = cmd.split(None, 1)[1].partition("=")
+            CONFIG[k.strip()] = v.strip()
+        else:
+            print("Command '%s' not found. Use 'help' to get a list of "
+                  "available commands." % cmd)
+        sys.stdout.write("gphoto2: {Canon EOS 400D} /> ")
+        sys.stdout.flush()
+    sys.exit(0)
+
+# ---- one-shot CLI ----
+note("cli " + " ".join(a for a in args if a.startswith("--")))
+time.sleep(START)
+i = 0
+while i < len(args):
+    a = args[i]
+    if a == "--get-config":
+        emit_config(args[i + 1]); i += 2
+    elif a in ("--set-config", "--set-config-value"):
+        k, _, v = args[i + 1].partition("="); CONFIG[k] = v; i += 2
+    elif a == "--capture-image-and-download":
+        do_capture(filename_arg().replace("%C", "jpg")); i += 1
+    else:
+        i += 1
+sys.exit(0)
