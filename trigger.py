@@ -29,25 +29,30 @@ libgpiod v1 and v2 (recent Raspberry Pi OS ships v2), so the argv is built by
 Two daemon threads cooperate:
 
   - a **reader** thread streams edges from one long-lived `gpiomon` in real time
-    (never blocked by a capture) and, for each debounced edge, sets a single
-    "capture requested" flag;
+    (never blocked by a capture) and records the **timestamp** of the most recent
+    debounced edge as a coalesced "capture requested";
   - a **worker** thread performs captures one at a time.
 
-The 400D emits a **phantom obstruct edge the instant each capture finishes** —
-its USB re-enumeration couples a transient onto the sensor line (confirmed in the
-logs: an edge at the exact second every shot completes, which a hands-off
-operator can't produce, having no completion signal to react to). So after each
-shot the worker settles briefly and then **discards anything the reader queued
-during the shot**, swallowing that transient instead of firing a phantom frame.
-The trade-off is that a slide dropped *during* a capture isn't queued — but on
-this camera a shot takes ~18s and the operator can't feed faster than that
-anyway, so real drops land in the gap and fire normally.
+The 400D emits a **phantom obstruct edge as each capture finishes** — its USB
+re-enumeration couples a transient onto the sensor line (confirmed in the logs:
+an edge at the exact second a shot completes, which a hands-off operator can't
+produce, having no completion signal to react to).
 
-(An earlier version tried to keep queued drops by level-checking the beam with
+That transient is rejected **by timestamp, not by a blanket settle**: the capture
+callback reports the moment the camera finished its USB work, and an edge landing
+within `cooldown_s` of that moment is discarded as the phantom. Every other edge
+is honoured immediately — including one that arrived *during* a capture, which is
+a real slide the operator dropped while the previous frame was still downloading.
+
+This replaces an earlier model that waited 2s after every shot and then threw away
+whatever had queued during it. That reliably ate the phantom, but the journal
+showed it also eating genuine slides whenever the operator fed faster than the
+~8s capture cycle — silent frame loss — and it added ~2s of dead time to every
+slide. (An even earlier attempt kept queued drops by level-checking the beam with
 `gpioget`, but the reader's `gpiomon` holds the line, so every check failed
-"sensor read failed" and dropped the slide — hence this simpler, reliable
-model.) The capture callback is serialized by the server behind the same camera
-lock as the web UI, so a sensor trigger and a button press can never overlap.
+"sensor read failed" and dropped the slide.) The capture callback is serialized
+by the server behind the same camera lock as the web UI, so a sensor trigger and
+a button press can never overlap.
 
 Nothing here runs unless `mode` is "gpio" in settings, so importing/using this
 module with the default config is a safe no-op (and needs no GPIO hardware).
@@ -72,12 +77,18 @@ TRIGGER_DEFAULTS = {
     "bias": "pull-up",        # internal bias: pull-up|pull-down|disable|as-is
                               # (pull-up gives an open-collector sensor a defined
                               #  idle HIGH; use as-is for a push-pull output)
-    "cooldown_s": 2.0,        # post-capture settle: after a shot fires, wait this
-                              #  long, then discard any edge that queued during the
-                              #  shot. Swallows the camera's USB re-enumeration
-                              #  transient — a phantom obstruct edge that lands on
-                              #  the sensor line the instant each capture finishes
-                              #  (confirmed in the logs). See SensorTrigger._serve.
+    "cooldown_s": 1.0,        # PHANTOM WINDOW (seconds). An edge whose timestamp
+                              #  falls within this long of the moment the camera
+                              #  finished its USB work is treated as the 400D's
+                              #  re-enumeration transient and ignored. Every other
+                              #  edge is honoured, including one that landed mid-
+                              #  capture. See SensorTrigger._serve.
+                              #  Keep it TIGHT: it is also the blind spot right
+                              #  after a shot, so a wide window silently eats
+                              #  slides from an operator who feeds quickly. The
+                              #  `[capture] ... tail=` timings in the journal,
+                              #  next to the edge lines, show the real offset if
+                              #  this needs tuning on the hardware.
 }
 
 # Reader-side contact-bounce debounce (seconds): collapse the several edges of a
@@ -85,9 +96,11 @@ TRIGGER_DEFAULTS = {
 # is seconds away, never sub-second.
 _READER_BOUNCE = 0.3
 
-# Floor for the post-capture settle regardless of a stale persisted cooldown_s,
-# so the re-enumeration transient (~1-2s) is reliably covered.
-_SETTLE_MIN = 2.0
+# The phantom is emitted when gphoto2 closes the USB session, which is a moment
+# *before* the callback returns (metering and bookkeeping follow). The capture
+# callback reports the USB-completion time itself, but allow a little slack
+# either side of it in case that epoch is reported slightly late.
+_PHANTOM_LEAD = 0.5
 
 
 class TriggerError(Exception):
@@ -155,9 +168,12 @@ class SensorTrigger:
         self.edge = "rising" if self.active_high else "falling"
         self.bias = str(_cfg(settings, "bias"))
         self._bounce = _READER_BOUNCE
-        self._settle = max(cooldown, _SETTLE_MIN)   # post-capture quiet window
+        self._phantom = cooldown           # ignore edges this close to USB-done
         self._stop = threading.Event()
         self._req = threading.Event()      # a capture is requested (coalesced)
+        self._req_at = 0.0                 # monotonic time of that edge
+        self._req_lock = threading.Lock()
+        self._usb_done = None              # end of the last capture's USB work
         self._reader: threading.Thread | None = None
         self._worker: threading.Thread | None = None
         self._proc: subprocess.Popen | None = None
@@ -221,7 +237,7 @@ class SensorTrigger:
                     continue
                 last = now
                 self._log("[trigger] edge -> capture requested")
-                self._req.set()                        # coalesced: at most 1 pending
+                self._request(now)                     # coalesced: at most 1 pending
             err = ""
             try:
                 err = (self._proc.stderr.read() or "").strip()
@@ -240,6 +256,39 @@ class SensorTrigger:
                       "restarting in 1s")
             self._stop.wait(1.0)
 
+    # -- request handoff (reader -> worker) ---------------------------------
+    def _request(self, ts: float) -> None:
+        """Record an edge, coalesced to the EARLIEST pending timestamp.
+
+        Earliest, not latest, and that distinction is the whole trick: the worker
+        empties the slot the moment it is free, so anything already pending is a
+        real slide dropped mid-capture. The phantom then arrives a fraction of a
+        second later — still inside the capture callback's tail — and if it
+        overwrote the slot, the worker would judge the phantom's timestamp,
+        discard it, and lose the real slide with it. Keeping the earlier
+        timestamp means the real drop is what gets judged, and the phantom is
+        simply absorbed."""
+        with self._req_lock:
+            if not self._req_at or ts < self._req_at:
+                self._req_at = ts
+        self._req.set()
+
+    def _take(self) -> float | None:
+        """Consume the pending request, returning the edge's timestamp."""
+        with self._req_lock:
+            ts = self._req_at
+            self._req_at = 0.0
+        self._req.clear()
+        return ts or None
+
+    def _is_phantom(self, ts: float) -> bool:
+        """True if this edge is the camera's USB re-enumeration transient rather
+        than a slide: it landed within the phantom window of the moment the last
+        capture finished talking to the camera."""
+        done = self._usb_done
+        return (done is not None
+                and done - _PHANTOM_LEAD <= ts <= done + self._phantom)
+
     # -- worker: capture one slide at a time --------------------------------
     def _serve(self) -> None:
         while not self._stop.is_set():
@@ -247,23 +296,29 @@ class SensorTrigger:
                 continue
             if self._stop.is_set():
                 break
-            self._req.clear()
+            ts = self._take()
+            if ts is None:
+                continue
+            # Reject the camera's own re-enumeration transient by WHEN it landed,
+            # so a real slide dropped mid-capture still gets shot (it used to be
+            # discarded wholesale along with the phantom).
+            if self._is_phantom(ts):
+                self._log("[trigger] ignoring phantom edge (camera "
+                          "re-enumeration)")
+                continue
             self._log("[trigger] edge detected -> capturing")
-            self._fire()
-            # Post-capture settle: the 400D's USB re-enumeration fires a phantom
-            # obstruct edge on the sensor line right as the shot completes. Wait
-            # for it to pass, then drop whatever queued during the shot (that
-            # transient, plus any slide staged mid-capture we can't shoot anyway)
-            # so it can't trigger a phantom frame. A genuinely new slide dropped
-            # after this window sets _req again and fires on the next loop.
-            self._stop.wait(self._settle)
-            self._req.clear()
+            self._usb_done = self._fire()
 
-    def _fire(self) -> None:
+    def _fire(self) -> float:
+        """Run the capture callback; returns the monotonic time the camera
+        finished its USB work (the callback reports it, since only the capture
+        path knows when gphoto2 let go of the bus). Falls back to 'now'."""
         try:
-            self._on_trigger()
+            done = self._on_trigger()
         except Exception as e:                         # never kill the worker
             self._log(f"[trigger] capture callback error: {e}")
+            return time.monotonic()
+        return done if isinstance(done, (int, float)) else time.monotonic()
 
     @staticmethod
     def _line_buffered(args: list[str]) -> list[str]:

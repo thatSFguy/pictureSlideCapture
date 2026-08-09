@@ -151,17 +151,32 @@ def public_brightness() -> dict:
     return {**BRIGHTNESS, "available": ok,
             "describe": brightness.describe(BRIGHTNESS),
             "import_error": "" if ok else brightness.import_error(),
-            "pending": _bright_q.qsize()}
+            "pending": _post_q.qsize()}
 
 
 # Correction runs on a worker thread, NOT in the capture path: a 10 MP
-# decode+encode is seconds of CPU (10-15 s on a Pi Zero W) and the operator's
-# hands-on loop is only ~18 s/slide. Queuing it keeps the Capture button snappy
-# and lets the next shot fire while the previous one is still being corrected.
+# decode+encode is seconds of CPU (measured 4-6 s on the Pi Zero W) against a
+# ~8 s capture cycle. Queuing it keeps the Capture button snappy and lets the
+# next shot fire while the previous one is still being corrected.
 # One worker (not a pool) so a single-core Pi never thrashes; Review's 4 s
 # auto-sync surfaces each frame's final state as the queue drains.
-_bright_q: queue.Queue = queue.Queue()
+# The SAME worker also embeds the EXIF metadata. exiftool is a large Perl program
+# whose cold start alone is seconds on a Pi Zero W, and nothing in the capture
+# response depends on it, so running it inline just made the operator wait. One
+# queue, one job per frame, so each file is touched by exactly one thread and the
+# brightness stale-swap token stays valid (a separate metadata job would rewrite
+# the file and invalidate it).
+_post_q: queue.Queue = queue.Queue()
 _sidecar_lock = threading.Lock()      # sidecar JSON is read-modify-write
+
+# Monotonic time the camera last finished talking to USB. Two users: do_capture
+# skips its readiness probe when the previous shot is long past, and the sensor
+# trigger uses it to date the 400D's re-enumeration transient. 0 = nothing shot
+# yet this run, which reads as "long ago" and is the right answer for both.
+LAST_USB_DONE = 0.0
+# Shoot blind if the last capture ended longer ago than this — the post-capture
+# bus drop is ~1-2s, so this is a wide margin.
+READY_PROBE_WINDOW = 20.0
 
 
 def update_exposure(name: str, status: str | None) -> None:
@@ -176,44 +191,59 @@ def update_exposure(name: str, status: str | None) -> None:
         save_exposure(ex)
 
 
-def _bright_worker() -> None:
-    """Drain the correction queue. Never raises — a failed correction leaves the
+def _post_worker() -> None:
+    """Drain the post-capture queue. Never raises — a failed job leaves the
     original capture in place, which is always a valid outcome."""
     while True:
-        item = _bright_q.get()
+        item = _post_q.get()
         try:
-            _correct_one(*item)
+            _post_one(*item)
         except Exception as e:                     # belt and braces: keep draining
-            print(f"[brightness] worker error: {e}", flush=True)
+            print(f"[post] worker error: {e}", flush=True)
         finally:
-            _bright_q.task_done()
+            _post_q.task_done()
 
 
-def _correct_one(path: Path, plan: dict, token: tuple | None) -> None:
+def _post_one(jpg: Path, raw: Path | None, plan: dict | None,
+              token: tuple | None) -> None:
+    """Everything a fresh capture needs that the operator doesn't have to wait
+    for: the brightness correction, then the EXIF metadata, then a re-meter if
+    the pixels moved. Runs off the camera lock, so the next slide can fire while
+    this is still going."""
     t0 = time.monotonic()
-    if not path.is_file():
+    if not jpg.is_file():
         return                                     # deleted/redone while queued
-    try:
-        res = brightness.correct(path, plan,
-                                 keep_original=BRIGHTNESS["keep_original"],
-                                 quality=BRIGHTNESS["quality"], expect=token)
-    except brightness.BrightnessError as e:
-        print(f"[brightness] {path.name}: {e}", flush=True)
-        return
-    # The correction rewrote the file, so re-apply the group/caption metadata
-    # and re-meter (fast — it reads the thumbnail we just corrected too).
-    write_metadata(path, None, load_captions().get(path.name, ""))
-    stats = jpegstats.luma_stats(path)
-    update_exposure(path.name, (stats or {}).get("status"))
-    print(f"[brightness] {path.name}: {res['ev']:+.2f} EV "
-          f"(gamma {res['gamma']}) -> {(stats or {}).get('status', '?')} "
-          f"in {time.monotonic() - t0:.1f}s", flush=True)
+    corrected = None
+    if plan:
+        try:
+            corrected = brightness.correct(
+                jpg, plan, keep_original=BRIGHTNESS["keep_original"],
+                quality=BRIGHTNESS["quality"], expect=token)
+        except brightness.BrightnessError as e:
+            print(f"[brightness] {jpg.name}: {e}", flush=True)
+    # Metadata last, so it is written over the final pixels (a correction
+    # rewrites the whole file and would otherwise drop it).
+    t_meta = time.monotonic()
+    write_metadata(jpg, raw, load_captions().get(jpg.name, ""))
+    meta_s = time.monotonic() - t_meta
+    if corrected:
+        # Re-meter: the correction moved the pixels AND the embedded thumbnail
+        # that jpegstats reads, so Review's cached verdict must be refreshed.
+        stats = jpegstats.luma_stats(jpg)
+        update_exposure(jpg.name, (stats or {}).get("status"))
+        print(f"[brightness] {jpg.name}: {corrected['ev']:+.2f} EV "
+              f"(gamma {corrected['gamma']}) -> "
+              f"{(stats or {}).get('status', '?')}", flush=True)
+    print(f"[post] {jpg.name}: meta={meta_s:.1f}s "
+          f"total={time.monotonic() - t0:.1f}s (queue {_post_q.qsize()})",
+          flush=True)
 
 
-def queue_brightness(jpg: Path | None, stats: dict | None,
-                     derived: bool = False) -> dict | None:
-    """Plan a correction for a fresh capture and queue it. Returns the planned
-    correction (for the capture response) or None if the frame is left alone.
+def plan_brightness(jpg: Path | None, stats: dict | None,
+                    derived: bool = False) -> dict | None:
+    """Plan a correction for a fresh capture (queuing is the caller's job, as
+    part of the one post-capture job). Returns the planned correction for the
+    capture response, or None if the frame is left alone.
 
     Skips RAW-derived previews: with imageformat=RAW the JPEG is only a preview
     extracted from the CR2, and the CR2 is what actually gets developed."""
@@ -221,12 +251,7 @@ def queue_brightness(jpg: Path | None, stats: dict | None,
         return None
     if not brightness.available():
         return None
-    plan = brightness.plan(stats, BRIGHTNESS)
-    if plan:
-        # Token the file as it is NOW: the worker refuses to swap if Redo-last
-        # (or a delete) replaced this frame while it sat in the queue.
-        _bright_q.put((jpg, plan, brightness.identity(jpg)))
-    return plan
+    return brightness.plan(stats, BRIGHTNESS)
 
 
 def set_reshoot(cfg: dict) -> dict:
@@ -263,22 +288,29 @@ def _advance_once() -> dict:
         return {"ok": False, "error": str(e) or "advance not implemented"}
 
 
-def sensor_capture() -> None:
+def sensor_capture() -> float:
     """Sensor-trigger callback (runs on the trigger thread). Capture one frame,
     serialized behind the camera lock so it can't overlap a button-press capture
     or an update. Skips the trigger if the camera is busy — never blocks the
-    watcher for long. Never raises (the watcher must survive)."""
+    watcher for long. Never raises (the watcher must survive).
+
+    Returns the monotonic time the camera finished with USB, which is what the
+    trigger dates the re-enumeration transient from (see trigger.SensorTrigger).
+    On a skip or a failure that is simply 'now', so the phantom window covers
+    whatever the camera did before giving up."""
     t0 = time.monotonic()
     if not _lock_acquire("sensor capture", 8):
         print(f"[trigger] camera busy ({lock_status()}) — SKIPPED this slide",
               flush=True)
-        return
+        return time.monotonic()
     # Hands-off batch: be patient so a shot fired while the 400D is still
     # re-enumerating rides it out instead of failing (the UI stays fail-fast).
     prev = (cam.retries, cam.backoff)
     cam.retries, cam.backoff = max(cam.retries, 6), max(cam.backoff, 1.0)
+    epoch = None
     try:
         res = do_capture()
+        epoch = LAST_USB_DONE                      # set by a successful capture
         status = (res.get("exposure") or {}).get("status", "?")
         rs = res.get("reshoots") or []
         print(f"[trigger] captured {res.get('name')} [{status}] in "
@@ -290,6 +322,9 @@ def sensor_capture() -> None:
     finally:
         cam.retries, cam.backoff = prev
         _lock_release()
+    # A failed capture never reached the point where USB went quiet, so date the
+    # phantom window from now — the camera was on the bus right up to the error.
+    return epoch or time.monotonic()
 
 
 def set_trigger(cfg: dict) -> dict:
@@ -728,35 +763,60 @@ def _cleanup_reshoot() -> None:
 
 
 def do_capture() -> dict:
-    """Capture one frame into the current group. Assumes cam_lock held."""
+    """Capture one frame into the current group. Assumes cam_lock held.
+
+    Only the camera work happens here. Metadata embedding and any brightness
+    correction are handed to the post-capture worker, because the operator is
+    waiting on this function and on nothing that follows it."""
+    global LAST_USB_DONE
+    t0 = time.monotonic()
     prefix, n = PREFIX, next_index(PREFIX)
     stem = f"{prefix}_{n:04d}"
-    # Fire only once the camera is back on the bus. The 400D re-enumerates after
-    # every SDRAM capture, so firing blind right after the previous slide often
-    # downloads nothing and forces a slow wait-then-refire recovery (~18s). A
-    # quick readiness probe first (no settle) makes the first shot succeed.
-    cam.wait_ready(settle=0)
+    t_idx = time.monotonic()
+    # The 400D drops off the bus for ~1-2s after each SDRAM capture, so firing
+    # blind right behind the previous slide downloads nothing and forces a slow
+    # wait-then-refire recovery. Probe only when the last shot was recent enough
+    # for that to be possible — the probe is a whole gphoto2 session (seconds on
+    # a Pi Zero W), and paying it before every shot bought nothing at the
+    # operator's actual pace. If the camera is unexpectedly away, _grab's
+    # existing retry still recovers.
+    if t0 - LAST_USB_DONE < READY_PROBE_WINDOW:
+        cam.wait_ready(settle=0)
+    t_ready = time.monotonic()
     jpg, raw, derived = _grab(stem)
+    t_shot = time.monotonic()
     stats = jpegstats.luma_stats(jpg)
     reshoots = []
     if RESHOOT["enabled"] and stats and stats.get("status") in _FLAGGED:
         jpg, raw, derived, stats, reshoots = _auto_reshoot(
             stem, jpg, raw, derived, stats)
-    write_metadata(jpg, raw)
+    # The camera is done talking to USB as of here. The sensor trigger uses this
+    # to recognise the re-enumeration transient that lands right about now.
+    LAST_USB_DONE = t_meter = time.monotonic()
     if stats:                                      # cache verdict for Review
         update_exposure(jpg.name, stats.get("status"))
-    # Digital brightness correction (queued; the worker rewrites the file and
-    # re-meters it). Runs AFTER any optical reshoot, so it only has to fix what
-    # the shutter couldn't — and it never touches the RAW sibling.
-    corr = queue_brightness(jpg, stats, derived)
+    # Digital brightness correction, planned now (the response reports the EV)
+    # and applied by the worker. Planned AFTER any optical reshoot, so it only
+    # has to fix what the shutter couldn't — and it never touches the RAW.
+    corr = plan_brightness(jpg, stats, derived)
+    # One job per frame: correction (if any) then metadata, off the camera lock.
+    # Token the file as it is NOW so the worker refuses to swap if Redo-last (or
+    # a delete) replaced this frame while it sat in the queue.
+    _post_q.put((jpg, raw, corr, brightness.identity(jpg) if corr else None))
     # Auto-advance to the next slide (no-op unless enabled). The image is
     # already saved, so a failed advance is reported, not fatal.
     adv = _advance_once() if (advancer.enabled and ADVANCE.get("after_capture")) \
         else None
-    return {"ok": True, "name": jpg.name, "index": n, "count": image_count(prefix),
-            "raw": raw.name if raw else None, "preview_from_raw": derived,
-            "exposure": stats, "advance": adv, "reshoots": reshoots,
-            "brightness": corr}
+    res = {"ok": True, "name": jpg.name, "index": n, "count": image_count(prefix),
+           "raw": raw.name if raw else None, "preview_from_raw": derived,
+           "exposure": stats, "advance": adv, "reshoots": reshoots,
+           "brightness": corr}
+    end = time.monotonic()
+    print(f"[capture] {jpg.name}: scan={t_idx - t0:.1f}s "
+          f"probe={t_ready - t_idx:.1f}s shot={t_shot - t_ready:.1f}s "
+          f"meter={t_meter - t_shot:.1f}s tail={end - t_meter:.1f}s "
+          f"total={end - t0:.1f}s", flush=True)
+    return res
 
 
 def do_advance() -> dict:
@@ -2136,8 +2196,10 @@ function fillBright(b){ if(!b) return;
     + 'itself and restarts if needed, about a minute on WiFi.'
     + (b.import_error?(' (' + b.import_error + ')'):'');
   else if(installing) { /* the installer owns the message while it runs */ }
+  /* The queue also carries the metadata write for every frame, not just the
+     corrections, so word it as finishing rather than correcting. */
   else if(b.pending) $('#brMsg').textContent = b.pending+' frame'+(b.pending===1?'':'s')
-    +' still being corrected in the background…';
+    +' still being finished in the background…';
   else $('#brMsg').textContent = BR_NOTE;
 }
 /* ---- in-app install of the optional native dependency ---- */
@@ -2481,9 +2543,10 @@ def main():
     except TriggerError as e:
         print(f"  sensor trigger not started ({e}) — enable it later in Setup.")
 
-    # Brightness-correction worker (daemon: a queued frame is never more
-    # valuable than a clean shutdown — the untouched capture is already saved).
-    threading.Thread(target=_bright_worker, name="brightness",
+    # Post-capture worker: brightness correction + EXIF metadata (daemon: a
+    # queued frame is never more valuable than a clean shutdown — the capture
+    # itself is already saved, only the embedded caption would be missing).
+    threading.Thread(target=_post_worker, name="post-capture",
                      daemon=True).start()
     print(f"Brightness:      {brightness.describe(BRIGHTNESS)}")
 

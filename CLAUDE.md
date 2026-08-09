@@ -262,7 +262,7 @@ Files (all in repo root; stdlib only, with one OPTIONAL apt dependency —
   Slide density varies per frame and the light pad can't be re-dialed per shot,
   so after each capture a flagged frame is pulled onto a target brightness by
   re-encoding the JPEG. Complements `_auto_reshoot` (optical): this costs no
-  shutter actuation and no extra ~18s capture cycle, but can't recover clipped
+  shutter actuation and no extra ~8s capture cycle, but can't recover clipped
   highlights — reshoot is still the fix for those.
   - **Curve = gamma, not linear gain**: `out = 255*(in/255)**g` with `g` solved
     so the metered mean lands on `target`. Pins 0 and 255, so brightening can
@@ -339,21 +339,36 @@ Files (all in repo root; stdlib only, with one OPTIONAL apt dependency —
 - `trigger.py` — optical-sensor capture trigger (settings-driven, default
   `off`). **Two daemon threads** (libgpiod via subprocess through `gpiocli`, same
   pattern as advance.py — needs `apt install gpiod`, now in the appliance image):
-  a **reader** streams edges from one long-lived `gpiomon` in real time and, for
-  each debounced edge, sets a single coalesced "capture requested" flag; a
-  **worker** performs captures one at a time on the **unobstructed→obstructed**
-  edge. **Key hardware quirk (fixed here):** the 400D's USB re-enumeration fires
-  a **phantom obstruct edge on the sensor line the instant each capture
-  finishes** (confirmed in the logs — an edge at the exact second every ~18s shot
-  completes, which a hands-off operator can't produce). So after each shot the
-  worker **settles (`cooldown_s`, floored at `_SETTLE_MIN`=2s) then discards
-  anything the reader queued during the shot**, swallowing that transient instead
-  of firing a phantom frame; a genuinely new slide dropped after the window fires
-  normally. (An earlier attempt kept mid-capture drops by level-checking the beam
+  a **reader** streams edges from one long-lived `gpiomon` in real time and
+  records the **timestamp** of each debounced edge as a coalesced "capture
+  requested"; a **worker** performs captures one at a time on the
+  **unobstructed→obstructed** edge. **Key hardware quirk:** the 400D's USB
+  re-enumeration fires a **phantom obstruct edge on the sensor line as each
+  capture finishes** (confirmed in the logs — an edge at the exact second a shot
+  completes, which a hands-off operator can't produce).
+  The transient is rejected **by timestamp, not by a blanket settle**:
+  `sensor_capture` returns the moment the camera finished its USB work
+  (`LAST_USB_DONE`), and an edge landing within `cooldown_s` (default **1.0s**,
+  plus `_PHANTOM_LEAD`=0.5s of slack before it) of that moment is discarded.
+  Everything else is honoured immediately, **including an edge that arrived
+  mid-capture** — a real slide dropped while the previous frame was downloading.
+  **This replaced a settle-and-clear model (wait 2s after every shot, then throw
+  away whatever queued during it) that was losing slides.** The 2026-08-09
+  journal proved it: in the 18:37:22–18:38:15 stretch, when the operator fed
+  faster than the ~8s cycle, five `edge -> capture requested` lines have no
+  matching `edge detected -> capturing` — silent frame loss, plus ~2s of dead
+  time on every slide. Note the journal also shows **no phantom edge at all**
+  through most of a 4-hour run, so the transient is rarer than the old design
+  assumed and a wide blind spot was never worth its cost.
+  **Coalescing keeps the EARLIEST pending edge, not the latest** — this is
+  load-bearing and was a bug when first written the other way: the phantom
+  arrives during the callback's tail, so a "latest wins" slot let it overwrite a
+  real mid-capture drop, and the worker then judged the *phantom's* timestamp,
+  discarded it, and lost the real slide with it.
+  (An earlier attempt kept mid-capture drops by level-checking the beam
   with `gpioget`, but the reader's own `gpiomon` holds the line, so every check
   failed *"sensor read failed"* and dropped the slide — that regression is
-  removed.) The operator can't feed faster than ~18s/shot anyway, so real drops
-  land in the gap. **Polarity is configurable** because sensor OUT idle state
+  removed.) **Polarity is configurable** because sensor OUT idle state
   varies: `active_high=False` (default) treats obstructed as LOW → **falling**
   edge; `active_high=True` → **rising** edge. `bias` sets an internal pull-up
   (default, gives an open-collector sensor a defined idle) / pull-down / disable.
@@ -411,15 +426,23 @@ Features:
   which left the operator looking at a ticked control they couldn't untick —
   reading as "this is running and I can't stop it" when in fact nothing was
   being changed. Keep the control live; explain state in the note.
+- **Post-capture worker** (`_post_q` / `_post_one`) — ONE background thread doing
+  everything the operator must not wait for: the brightness correction, then the
+  EXIF metadata write, then a re-meter if the pixels moved. One job per frame, so
+  each file is touched by exactly one thread (a separate metadata job would
+  rewrite the file and invalidate brightness's stale-swap token).
+  **The metadata write moved here from the capture path** — `exiftool` is a large
+  Perl program whose cold start alone costs seconds on a Zero W, and nothing in
+  the capture response depends on it, so inline it was pure operator wait.
 - **Brightness correction** (Setup → Brightness correction; see `brightness.py`):
   after each capture, a flagged frame is queued for a gamma correction onto the
-  target. Runs on a **single background worker thread, NOT in the capture path**
-  — a 10MP decode+encode is ~0.5s on the dev box but 10-15s on a Pi Zero W,
-  against a ~18s/slide operator loop, so queuing keeps the Capture button snappy
-  and lets the next shot fire while the last one is still being corrected. The
-  capture response reports the planned `ev` (Capture shows "brightening +0.9 EV"
-  and a `correcting` chip); the worker then rewrites the file, re-applies the
-  group/caption metadata, and re-meters, which Review's 4s auto-sync picks up.
+  target. Runs on the post-capture worker, **NOT in the capture path** — a 10MP
+  decode+encode is ~0.5s on the dev box but 4-6s on a Pi Zero W (measured in the
+  journal), against an ~8s capture cycle, so queuing keeps the Capture button
+  snappy and lets the next shot fire while the last one is still being corrected.
+  The capture response reports the planned `ev` (Capture shows "brightening
+  +0.9 EV" and a `correcting` chip); the worker then rewrites the file, applies
+  the group/caption metadata, and re-meters, which Review's 4s auto-sync picks up.
   **Stale-swap guard:** group filenames get reused (Redo-last frees a number and
   the next shot takes it back), so each queued job carries a size+mtime token and
   the worker refuses to swap if the frame changed while it was queued — otherwise
@@ -453,6 +476,37 @@ Features:
 Camera access is serialized behind a lock; retries are tuned short
 (`Camera(retries=3, backoff=0.8)`) so the UI fails fast (~2.5s) when the camera
 is off rather than hanging ~9s.
+
+### Throughput (the live constraint — thousands of slides to get through)
+Measured on the Pi Zero W appliance, 2026-08-09, JPEG (not RAW): a sensor-
+triggered frame is **~7.5–8.5s** end to end. The **~18s/frame figure used
+elsewhere in this file is stale** — that was the RAW cycle.
+
+- **Trigger latency is zero.** In ~4 hours of journal, `edge -> capture
+  requested` and `edge detected -> capturing` are always the same second. There
+  is no lock contention to chase and no worker delay; don't go looking again.
+- **The operator, not the rig, set the pace.** Steady state was `captured` →
+  next edge in 10–11s, i.e. the machine idle ~10s of every ~19s. Speeding up the
+  capture only helps once the feed rate comes down to meet it.
+- `do_capture` logs a **breakdown to the journal** so this never has to be
+  guessed again:
+  `[capture] <name>: scan=… probe=… shot=… meter=… tail=… total=…`
+  (`scan` = the two `OUT_DIR` globs for the next index + count, `probe` = the
+  readiness gphoto2 session, `shot` = `_grab`, `meter` = jpegstats, `tail` =
+  planning/queueing). `[post] <name>: meta=… total=… (queue N)` covers the
+  background half.
+- Two costs already removed: the **readiness probe** is now skipped unless the
+  previous shot ended within `READY_PROBE_WINDOW`=20s (it is a whole gphoto2
+  session, and at the operator's real pace it was pure overhead every frame —
+  `_grab`'s existing retry still covers an unexpectedly absent camera), and the
+  **exiftool metadata write** moved to the post-capture worker.
+- Still on the table if more is needed: stop re-sending `capturetarget` inside
+  every `cam.capture()` (a PTP write before every shutter), and the big one — a
+  **persistent gphoto2 session** (`--shell` or python-gphoto2) instead of one
+  subprocess per operation. That would collapse the per-op USB/PTP setup, but it
+  fights `camera.py`'s retry-on-re-enumeration design (a fresh process re-detects
+  the device for free, which is what makes the retry work) and python-gphoto2 is
+  a pip dependency, which this project has deliberately avoided.
 
 Run (dev host):
     python3 capture_server.py            # http://localhost:8080
@@ -532,6 +586,16 @@ Notes / gotchas learned:
   host degrades to a visible no-op. **Not yet run on the Pi** — needs
   `sudo apt install python3-pil` there (self-update doesn't install packages),
   and the per-frame CPU cost on a Zero W is still to be measured.
+- [DONE 2026-08-09] **Real production run on the appliance** — many hundreds of
+  slides captured via the sensor trigger across ~4 hours, with brightness
+  correction working on the Pi. Two problems found in that journal and fixed:
+  the sensor's settle-and-clear was **silently dropping slides** whenever the
+  operator fed faster than the capture cycle (now rejected by timestamp — see
+  `trigger.py`), and `exiftool` + a redundant readiness probe were sitting in
+  the capture path where the operator waits on them (both moved/skipped). Added
+  `[capture]`/`[post]` sub-timings so the cycle can be measured, not guessed.
+  **Not yet re-run on hardware** — the numbers to check next are `probe=` (should
+  be 0.0 in steady state) and `tail=`, which sets the right `cooldown_s`.
 - [TODO] Exposure/quality polish: tighter framing to drop the black mount
   border (more resolution + accurate metering), optional custom WB off the
   light pad (slides read slightly blue). Remove the temporary `/api/debugcapture`.
