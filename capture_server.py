@@ -174,6 +174,10 @@ _sidecar_lock = threading.Lock()      # sidecar JSON is read-modify-write
 # trigger uses it to date the 400D's re-enumeration transient. 0 = nothing shot
 # yet this run, which reads as "long ago" and is the right answer for both.
 LAST_USB_DONE = 0.0
+# Last successful camera-side status read, reused by the background poll so it
+# never has to take the camera lock while a hands-off run is going (see
+# read_status_cached). Empty until the first successful read.
+_CAM_STATUS: dict = {"connected": False}
 # Shoot blind if the last capture ended longer ago than this — the post-capture
 # bus drop is ~1-2s, so this is a wide margin.
 READY_PROBE_WINDOW = 20.0
@@ -288,7 +292,7 @@ def _advance_once() -> dict:
         return {"ok": False, "error": str(e) or "advance not implemented"}
 
 
-def sensor_capture() -> float:
+def sensor_capture(edge_ts: float | None = None) -> float:
     """Sensor-trigger callback (runs on the trigger thread). Capture one frame,
     serialized behind the camera lock so it can't overlap a button-press capture
     or an update. Skips the trigger if the camera is busy — never blocks the
@@ -299,17 +303,25 @@ def sensor_capture() -> float:
     On a skip or a failure that is simply 'now', so the phantom window covers
     whatever the camera did before giving up."""
     t0 = time.monotonic()
+    edge = edge_ts if edge_ts else t0
     if not _lock_acquire("sensor capture", 8):
         print(f"[trigger] camera busy ({lock_status()}) — SKIPPED this slide",
               flush=True)
         return time.monotonic()
+    lock_wait = time.monotonic() - t0
+    # THE number for a rig whose pusher keeps moving: how long after the sensor
+    # tripped did the exposure actually happen. Everything after it is download,
+    # by which time the slide is free to move.
+    def _shutter():
+        print(f"[trigger] SHUTTER at +{time.monotonic() - edge:.2f}s from edge "
+              f"(lock wait {lock_wait:.2f}s)", flush=True)
     # Hands-off batch: be patient so a shot fired while the 400D is still
     # re-enumerating rides it out instead of failing (the UI stays fail-fast).
     prev = (cam.retries, cam.backoff)
     cam.retries, cam.backoff = max(cam.retries, 6), max(cam.backoff, 1.0)
     epoch = None
     try:
-        res = do_capture()
+        res = do_capture(on_shutter=_shutter)
         epoch = LAST_USB_DONE                      # set by a successful capture
         status = (res.get("exposure") or {}).get("status", "?")
         rs = res.get("reshoots") or []
@@ -575,7 +587,7 @@ def _wipe(stem_glob: str) -> None:
             pass
 
 
-def _grab(stem: str, _retry: bool = True) -> tuple:
+def _grab(stem: str, _retry: bool = True, on_shutter=None) -> tuple:
     """Capture to <stem>.<ext>, normalize case, derive a preview if RAW-only.
     Returns (jpg, raw, derived) or raises CameraError. Assumes cam_lock held.
     capturetarget=Memory card is set inside cam.capture() (same gphoto2 session)
@@ -588,7 +600,7 @@ def _grab(stem: str, _retry: bool = True) -> tuple:
     glob = f"{stem}.*"
     _wipe(glob)                                    # clear any prior file at stem
     try:
-        gp_out = cam.capture(OUT_DIR / f"{stem}.%C")
+        gp_out = cam.capture(OUT_DIR / f"{stem}.%C", on_shutter=on_shutter)
     except CameraError:
         _wipe(glob)
         raise
@@ -620,8 +632,10 @@ def _grab(stem: str, _retry: bool = True) -> tuple:
         if _retry:
             print(f"[capture] no file for '{stem}' — waiting for the camera and "
                   "re-firing once", flush=True)
+            cam.forget_capturetarget()             # re-send it; a lost setting
+                                                   # is one reason for no file
             cam.wait_ready()
-            return _grab(stem, _retry=False)
+            return _grab(stem, _retry=False, on_shutter=on_shutter)
         # Still nothing after a retry. Log the full gphoto2 output + dir listing
         # to the journal (View logs) and echo a short hint in the error.
         listing = sorted(p.name for p in OUT_DIR.iterdir() if p.is_file())
@@ -762,7 +776,7 @@ def _cleanup_reshoot() -> None:
     _wipe("_reshoot*.*")
 
 
-def do_capture() -> dict:
+def do_capture(on_shutter=None) -> dict:
     """Capture one frame into the current group. Assumes cam_lock held.
 
     Only the camera work happens here. Metadata embedding and any brightness
@@ -783,7 +797,7 @@ def do_capture() -> dict:
     if t0 - LAST_USB_DONE < READY_PROBE_WINDOW:
         cam.wait_ready(settle=0)
     t_ready = time.monotonic()
-    jpg, raw, derived = _grab(stem)
+    jpg, raw, derived = _grab(stem, on_shutter=on_shutter)
     t_shot = time.monotonic()
     stats = jpegstats.luma_stats(jpg)
     reshoots = []
@@ -909,29 +923,46 @@ def auto_expose(max_steps: int = 6) -> dict:
         cam.retries, cam.backoff = prev_retries, prev_backoff
 
 
+def _group_state() -> dict:
+    """The half of the status that needs no camera (and so no lock)."""
+    return {"prefix": PREFIX, "count": image_count(PREFIX),
+            "recent": recent_images(PREFIX), "captions": load_captions(),
+            "exposure": load_exposure(), "reshoot": dict(RESHOOT),
+            "brightness": public_brightness()}
+
+
+def read_status_cached() -> dict:
+    """Status with the camera fields served from the last successful read.
+
+    Used for the UI's background poll while the sensor trigger is armed. That
+    poll used to take cam_lock and hold it for two gphoto2 sessions; an edge
+    landing in that window sat waiting behind it, which on a rig where a moving
+    pusher must beat the shutter is a real lost frame — and it was invisible in
+    the journal, because the trigger logs "capturing" BEFORE it waits for the
+    lock. The camera fields (battery, mode, shot count, exposure settings) barely
+    change during a run, so a cached copy costs the operator nothing."""
+    return {**_CAM_STATUS, **_group_state(), "cached": True}
+
+
 def read_status() -> dict:
     """Light status: one batched gphoto2 call. Assumes cam_lock held."""
+    global _CAM_STATUS
     try:
         model = cam.model()
         v = cam.get_many(["batterylevel", "autoexposuremode", "availableshots",
                           "iso", "aperture", "shutterspeed", "imageformat"])
     except CameraError as e:
-        return {"connected": False, "error": friendly(str(e)), "prefix": PREFIX,
-                "count": image_count(PREFIX), "recent": recent_images(PREFIX),
-                "captions": load_captions(), "exposure": load_exposure(),
-                "reshoot": dict(RESHOOT), "brightness": public_brightness()}
+        _CAM_STATUS = {"connected": False, "error": friendly(str(e))}
+        return {**_CAM_STATUS, **_group_state()}
     mode = v.get("autoexposuremode", "?")
-    return {
+    _CAM_STATUS = {
         "connected": True, "model": model,
         "battery": v.get("batterylevel", "?"), "mode": mode,
         "manual": mode.lower() == "manual", "shots": v.get("availableshots", "?"),
         "iso": v.get("iso", "?"), "aperture": v.get("aperture", "?"),
         "shutter": v.get("shutterspeed", "?"), "format": v.get("imageformat", "?"),
-        "prefix": PREFIX, "count": image_count(PREFIX),
-        "recent": recent_images(PREFIX), "captions": load_captions(),
-        "exposure": load_exposure(), "reshoot": dict(RESHOOT),
-        "brightness": public_brightness(),
     }
+    return {**_CAM_STATUS, **_group_state()}
 
 
 def read_settings() -> dict:
@@ -951,6 +982,10 @@ def apply_settings(body: dict) -> dict:
     cam_settings = {k: str(body[k]) for k in EXPOSURE_KEYS if body.get(k)}
     if cam_settings:
         cam.configure(cam_settings)
+        # capturetarget is cached and normally sent once per session; a config
+        # write is the kind of thing that could disturb it, so re-send it on the
+        # next capture rather than assume it survived.
+        cam.forget_capturetarget()
     if "prefix" in body:
         PREFIX = sanitize_prefix(body["prefix"])
     adv_err = None
@@ -1415,7 +1450,14 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/":
             self._send(200, INDEX_HTML.encode(), "text/html; charset=utf-8")
         elif path == "/api/status":
-            self._with_camera(read_status, wait=0)   # poll: fail fast, skip silently
+            # While the sensor trigger is armed, never touch the camera for a
+            # background poll: it would hold cam_lock for two gphoto2 sessions
+            # and a slide arriving in that window waits behind it. On this rig
+            # the pusher keeps moving, so a delayed shutter is a spoiled frame.
+            if trigger is not None and trigger.enabled:
+                self._json(read_status_cached())
+            else:
+                self._with_camera(read_status, wait=0)   # poll: fail fast, skip
         elif path == "/api/settings":
             self._with_camera(read_settings)
         elif path == "/api/zip":

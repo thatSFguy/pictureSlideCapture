@@ -307,14 +307,19 @@ class SensorTrigger:
                           "re-enumeration)")
                 continue
             self._log("[trigger] edge detected -> capturing")
-            self._usb_done = self._fire()
+            self._usb_done = self._fire(ts)
 
-    def _fire(self) -> float:
+    def _fire(self, edge_ts: float) -> float:
         """Run the capture callback; returns the monotonic time the camera
         finished its USB work (the callback reports it, since only the capture
-        path knows when gphoto2 let go of the bus). Falls back to 'now'."""
+        path knows when gphoto2 let go of the bus). Falls back to 'now'.
+
+        The edge timestamp is passed through so the capture path can report how
+        long the SHUTTER took to fire after the sensor tripped — the number that
+        decides whether the frame beats a moving pusher. Note this method is
+        entered before any camera lock is taken, so that wait is included."""
         try:
-            done = self._on_trigger()
+            done = self._on_trigger(edge_ts)
         except Exception as e:                         # never kill the worker
             self._log(f"[trigger] capture callback error: {e}")
             return time.monotonic()

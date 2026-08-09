@@ -13,6 +13,7 @@ Design notes (confirmed on hardware — see CLAUDE.md):
 from __future__ import annotations
 
 import subprocess
+import threading
 import time
 from pathlib import Path
 
@@ -42,16 +43,24 @@ class Camera:
         self.backoff = backoff
         self.verbose = verbose
         self.last_stdout = ""     # gphoto2 output of the most recent success
+        self._target_set = None   # capturetarget already sent this session
 
     def _run(self, args: list[str], timeout: float = 25.0,
-             cwd: str | None = None) -> str:
+             cwd: str | None = None, on_event=None) -> str:
         """Run one gphoto2 command with retry-on-IO-error + backoff. `cwd` sets
         the working directory — gphoto2 needs a WRITABLE cwd to stage a download
         even when --filename is absolute, so captures must run from the output
-        dir, not the (root-owned) service WorkingDirectory."""
+        dir, not the (root-owned) service WorkingDirectory.
+
+        `on_event` switches to a line-streaming run so the caller learns the
+        shutter has fired without waiting for the download (see _run_streaming)."""
         last = ""
         for attempt in range(1, self.retries + 1):
             try:
+                if on_event is not None:
+                    out = self._run_streaming(args, timeout, cwd, on_event)
+                    self.last_stdout = out
+                    return out
                 proc = subprocess.run(
                     ["gphoto2", *args],
                     capture_output=True, text=True, timeout=timeout, cwd=cwd,
@@ -60,6 +69,8 @@ class Camera:
                 raise CameraError("gphoto2 not installed on this host") from e
             except subprocess.TimeoutExpired:
                 last = f"timeout after {timeout}s"
+            except CameraError as e:               # streaming run, non-zero exit
+                last = str(e)
             else:
                 if proc.returncode == 0:
                     self.last_stdout = proc.stdout
@@ -206,7 +217,64 @@ class Camera:
         if args:
             self._run(args)
 
-    def capture(self, dest: Path, capturetarget: str = "Internal RAM") -> str:
+    # gphoto2 prints one of these the moment the camera has the frame — i.e. the
+    # exposure is OVER and only the download remains. On a rig where a moving
+    # pusher must not disturb the slide before the shutter fires, that instant is
+    # the number that matters, so it is reported separately from the ~5s download
+    # that follows it.
+    _SHUTTER_MARKERS = ("new file is in location", "saving file as")
+
+    def _run_streaming(self, args: list[str], timeout: float, cwd: str | None,
+                       on_event) -> str:
+        """Like _run's single attempt, but reads stdout line by line so a caller
+        can be told the instant the shutter marker appears instead of finding out
+        when the whole download finishes. stderr is merged into stdout: we only
+        ever use it as error text, and merging avoids a second pipe that could
+        fill and deadlock while we are blocked reading the first."""
+        proc = subprocess.Popen(["gphoto2", *args], stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, text=True, bufsize=1,
+                                cwd=cwd)
+        # The deadline needs its own timer, NOT a check inside the read loop: a
+        # wedged gphoto2 prints nothing, so the loop would block in readline()
+        # forever and never reach the check. subprocess.run's timeout used to
+        # cover this, and losing it would let a sleeping camera pin the camera
+        # lock indefinitely.
+        out, fired, timed_out = [], False, threading.Event()
+
+        def _kill():
+            timed_out.set()
+            if proc.poll() is None:
+                proc.kill()
+
+        watchdog = threading.Timer(timeout, _kill)
+        watchdog.start()
+        try:
+            for line in proc.stdout:
+                out.append(line)
+                if not fired and any(m in line.lower()
+                                     for m in self._SHUTTER_MARKERS):
+                    fired = True
+                    if on_event:
+                        try:
+                            on_event()
+                        except Exception:      # never let a callback break a capture
+                            pass
+            proc.wait()
+        finally:
+            watchdog.cancel()
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=5)
+        if timed_out.is_set():
+            # Same wording (and same non-retryable outcome) as the plain path.
+            raise CameraError(f"timeout after {timeout}s")
+        text = "".join(out)
+        if proc.returncode != 0:
+            raise CameraError(text.strip() or f"gphoto2 exited {proc.returncode}")
+        return text
+
+    def capture(self, dest: Path, capturetarget: str = "Internal RAM",
+                on_shutter=None) -> str:
         """Trigger, download to `dest` (may create sibling files for RAW+JPEG).
         `dest` may use gphoto2's %C extension token. Returns the gphoto2 stdout
         (useful for diagnosing an empty download).
@@ -218,10 +286,19 @@ class Camera:
         it (gphoto2 only prints "New file is in location … on the camera"), so
         nothing lands locally. Set in the SAME gphoto2 invocation as the capture
         (on a retry the set is a no-op). Pass capturetarget="" to leave the
-        camera's current setting untouched."""
+        camera's current setting untouched.
+
+        `on_shutter` is called the moment the camera reports it has the frame —
+        exposure over, download still to come.
+
+        The capturetarget write is sent only ONCE per session (and again after
+        any failure), not before every shutter: it is a PTP round-trip sitting
+        directly in front of the exposure, and on this rig the sensor-to-shutter
+        delay is the throughput limit. If the camera ever loses the setting, the
+        capture returns no file and _grab's retry re-sends it."""
         dest.parent.mkdir(parents=True, exist_ok=True)
         args: list[str] = []
-        if capturetarget:
+        if capturetarget and capturetarget != self._target_set:
             args += ["--set-config-value", f"capturetarget={capturetarget}"]
         # ORDER MATTERS: --filename / --force-overwrite MUST precede the capture
         # action. gphoto2 2.5.28 (on the Pi) ignores a --filename that follows
@@ -236,4 +313,18 @@ class Camera:
         # 30s is generous (a full RAW cycle is ~5.6s) but bounded, so a wedged
         # camera (asleep / powered off) releases the caller's lock promptly
         # instead of pinning it for the old 90s.
-        return self._run(args, timeout=30.0, cwd=str(dest.parent))
+        try:
+            out = self._run(args, timeout=30.0, cwd=str(dest.parent),
+                            on_event=on_shutter)
+        except CameraError:
+            self._target_set = None                # re-send it on the next try
+            raise
+        if capturetarget:
+            self._target_set = capturetarget
+        return out
+
+    def forget_capturetarget(self) -> None:
+        """Drop the cached capturetarget so the next capture re-sends it. Call
+        after anything that could have reset the camera's config underneath us
+        (a settings change, a reconnect, a capture that downloaded nothing)."""
+        self._target_set = None

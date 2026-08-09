@@ -165,6 +165,16 @@ Files (all in repo root; stdlib only, with one OPTIONAL apt dependency —
 `python3-pil` for `brightness.py`, which no-ops without it):
 - `camera.py` — shared camera control: gphoto2 CLI wrapper, one subprocess per
   op, retry-on-IO-error, get/set config, capture. Used by both tools.
+  `capture(..., on_shutter=)` streams gphoto2's stdout (`_run_streaming`) and
+  calls back the instant the camera reports it has the frame — exposure over,
+  download still to come. That split is what makes the sensor-to-shutter latency
+  measurable; see "Throughput" below, it is the rig's binding constraint.
+  **The streaming path needs its own watchdog timer**, not a deadline checked in
+  the read loop: a wedged gphoto2 prints nothing, so the loop blocks in
+  `readline()` forever and the check is never reached. (`subprocess.run`'s
+  `timeout` covered this for free; losing it would let a sleeping camera pin the
+  camera lock indefinitely. Caught by a test with a stub that hangs before its
+  first line of output.)
   `ready()`/`wait_ready()` probe the camera for the next shot: the 400D drops off
   the USB bus for ~1-2s after each SDRAM capture, so before firing a rapid
   follow-up shot (auto-reshoot, auto-exposure) we poll a cheap config read until
@@ -477,36 +487,68 @@ Camera access is serialized behind a lock; retries are tuned short
 (`Camera(retries=3, backoff=0.8)`) so the UI fails fast (~2.5s) when the camera
 is off rather than hanging ~9s.
 
-### Throughput (the live constraint — thousands of slides to get through)
-Measured on the Pi Zero W appliance, 2026-08-09, JPEG (not RAW): a sensor-
-triggered frame is **~7.5–8.5s** end to end. The **~18s/frame figure used
-elsewhere in this file is stale** — that was the RAW cycle.
+### Throughput — READ THIS BEFORE OPTIMISING ANYTHING
+There are thousands of slides to get through, and the binding constraint is
+**sensor edge → shutter**, not the capture cycle. Optimising anything after the
+shutter is wasted effort.
 
-- **Trigger latency is zero.** In ~4 hours of journal, `edge -> capture
-  requested` and `edge detected -> capturing` are always the same second. There
-  is no lock contention to chase and no worker delay; don't go looking again.
-- **The operator, not the rig, set the pace.** Steady state was `captured` →
-  next edge in 10–11s, i.e. the machine idle ~10s of every ~19s. Speeding up the
-  capture only helps once the feed rate comes down to meet it.
-- `do_capture` logs a **breakdown to the journal** so this never has to be
-  guessed again:
-  `[capture] <name>: scan=… probe=… shot=… meter=… tail=… total=…`
-  (`scan` = the two `OUT_DIR` globs for the next index + count, `probe` = the
-  readiness gphoto2 session, `shot` = `_grab`, `meter` = jpegstats, `tail` =
-  planning/queueing). `[post] <name>: meta=… total=… (queue N)` covers the
-  background half.
-- Two costs already removed: the **readiness probe** is now skipped unless the
-  previous shot ended within `READY_PROBE_WINDOW`=20s (it is a whole gphoto2
-  session, and at the operator's real pace it was pure overhead every frame —
-  `_grab`'s existing retry still covers an unexpectedly absent camera), and the
-  **exiftool metadata write** moved to the post-capture worker.
-- Still on the table if more is needed: stop re-sending `capturetarget` inside
-  every `cam.capture()` (a PTP write before every shutter), and the big one — a
-  **persistent gphoto2 session** (`--shell` or python-gphoto2) instead of one
-  subprocess per operation. That would collapse the per-op USB/PTP setup, but it
-  fights `camera.py`'s retry-on-re-enumeration design (a fresh process re-detects
-  the device for free, which is what makes the retry work) and python-gphoto2 is
-  a pip dependency, which this project has deliberately avoided.
+**The mechanism (as described by the user, 2026-08-09).** The slide pusher is a
+rotary arm on a **continuously running motor with a manual speed controller —
+NOT controlled by the Pi**. Per revolution:
+- **3 o'clock** — the arm obstructs the light bar; the sensor fires. Rotation is
+  counter-clockwise.
+- **12 o'clock** — best case, where the picture is actually taken.
+- **10–11 o'clock** — where it typically lands.
+- **9 o'clock** — the new slide begins pushing the *old* one out of position.
+  Anything not exposed by here is a spoiled frame (the operator retrieves the
+  slide and re-feeds it).
+
+So the shutter has to fire within **half a revolution** of the trigger, and the
+motor speed must be set for the **WORST CASE** latency, not the average.
+**Variance is therefore as expensive as the mean** — one slow outlier forces the
+whole run to be slower. The ~5s USB download after the shutter is irrelevant to
+this race: once the camera has the frame, the slide is free to move.
+
+**The number to watch** is logged per sensor frame:
+`[trigger] SHUTTER at +X.XXs from edge (lock wait Y.YYs)` — emitted the moment
+gphoto2 reports the frame is on the camera (`Camera._SHUTTER_MARKERS`, streamed
+live from gphoto2's stdout by `_run_streaming`, not inferred after the download).
+
+**Correction to an earlier wrong conclusion.** It was previously recorded here
+that "trigger latency is zero, there is no lock contention to chase". That was
+wrong and cost time. `trigger._serve` logs `edge detected -> capturing` **before**
+`_fire()` → `sensor_capture()` → `_lock_acquire(..., 8)`, so **every camera-lock
+wait is invisible in the journal**. Same-second log lines prove nothing about it.
+The UI's 15s background `/api/status` poll used to take that lock and hold it for
+two gphoto2 sessions — a plausible source of exactly the "usually 10-11 o'clock,
+occasionally past 9" variance. It now serves cached camera fields
+(`read_status_cached`) whenever the sensor trigger is armed, and never touches
+the camera.
+
+Other costs taken off the pre-shutter path:
+- `capturetarget` is sent **once per session**, not before every shutter — it was
+  a PTP round-trip sitting directly in front of the exposure. Re-sent after any
+  failure, after `apply_settings`, and by `_grab`'s no-file retry
+  (`cam.forget_capturetarget()`).
+- The **readiness probe** (a whole gphoto2 session) is skipped unless the previous
+  shot ended within `READY_PROBE_WINDOW`=20s.
+- The **exiftool metadata write** moved to the post-capture worker.
+
+Full per-frame breakdown in the journal:
+`[capture] <name>: scan=… probe=… shot=… meter=… tail=… total=…`
+(`scan` = the two `OUT_DIR` globs for next-index + count, `probe` = readiness
+session, `shot` = `_grab` incl. download, `meter` = jpegstats, `tail` =
+planning/queueing), plus `[post] <name>: meta=… total=… (queue N)`.
+
+**If more is needed, the big lever is a persistent gphoto2 session** (`--shell`,
+or python-gphoto2) instead of one subprocess per operation, so process spawn +
+USB claim + PTP session open stop sitting in front of every exposure. It fights
+`camera.py`'s retry-on-re-enumeration design (a fresh process re-detects the
+device for free, which is what makes the retry work), so it needs a fallback that
+respawns the session. Measure `SHUTTER at +…` first — if the pre-shutter time is
+dominated by that setup, this is worth the complexity.
+**A hardware option costs nothing in software:** moving the sensor so it trips
+EARLIER in the revolution buys margin directly, without slowing the motor.
 
 Run (dev host):
     python3 capture_server.py            # http://localhost:8080
