@@ -15,6 +15,18 @@ Env knobs let the tests drive failure modes:
 import os, sys, time
 from pathlib import Path
 
+# Real gphoto2 is a C program writing through stdio, which BLOCK-buffers on a
+# pipe and only line-buffers when `stdbuf -oL` says so. Emulate BOTH halves or
+# the tests are a fiction: the first stub flushed after every line, the suite
+# passed, and the feature then hung on real hardware because gphoto2's replies
+# never left libc's buffer.
+#
+# stdbuf works by LD_PRELOAD and setting _STDBUF_O, which libc's startup reads.
+# Python ignores that, so honour it by hand — otherwise this stub would keep
+# block-buffering even when the caller correctly asked for line buffering.
+_LINE = os.environ.get("_STDBUF_O") == "L" or os.environ.get("FS_FLUSH") == "1"
+sys.stdout.reconfigure(line_buffering=_LINE, write_through=_LINE)
+
 START = float(os.environ.get("FS_START", "3.0"))
 EXPOSE = float(os.environ.get("FS_EXPOSE", "0.1"))
 DL = float(os.environ.get("FS_DL", "0.4"))
@@ -44,8 +56,8 @@ def emit_config(name):
 
 def do_capture(fname):
     time.sleep(EXPOSE)
-    print("New file is in location /capt0000.jpg on the camera", flush=True)
-    print("Saving file as %s" % fname, flush=True)
+    print("New file is in location /capt0000.jpg on the camera")
+    print("Saving file as %s" % fname)
     time.sleep(DL)
     Path(fname).write_bytes(Path(SRC).read_bytes())
 
@@ -73,7 +85,6 @@ if "--shell" in args:
     pattern = filename_arg("capt%04n.%C")
     shots = 0
     sys.stdout.write("gphoto2: {Canon EOS 400D} /> ")
-    sys.stdout.flush()
     for line in sys.stdin:
         cmd = line.strip()
         if not cmd:
@@ -100,7 +111,6 @@ if "--shell" in args:
             print("Command '%s' not found. Use 'help' to get a list of "
                   "available commands." % cmd)
         sys.stdout.write("gphoto2: {Canon EOS 400D} /> ")
-        sys.stdout.flush()
     sys.exit(0)
 
 # ---- one-shot CLI ----

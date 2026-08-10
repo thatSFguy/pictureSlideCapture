@@ -26,7 +26,12 @@ def fresh(**env):
     os.environ["FS_LOG"] = str(out / "calls.log")
     import importlib, camera as camera_mod
     importlib.reload(camera_mod)
-    return camera_mod, camera_mod.Camera(retries=2, backoff=0.1, verbose=True), out
+    # persistent defaults to OFF in the app (it broke capture on hardware once);
+    # these tests are about the feature, so they opt in explicitly.
+    cam = camera_mod.Camera(retries=2, backoff=0.1, verbose=True,
+                            persistent=True)
+    cam.set_capture_dir(out)
+    return camera_mod, cam, out
 
 
 def shoot(cam, out, n):
@@ -130,6 +135,48 @@ ok = el < 1.5 and cam._shell is not None
 print(f"    capture after --auto-detect took {el:.2f}s (session warm again)   "
       f"{'PASS' if ok else 'FAIL'}")
 fails += [] if ok else ["8"]
+cam.shutdown()
+
+print("\n=== 9. REGRESSION (v0.1.35): block-buffered gphoto2 must not hang ===")
+# The real bug. gphoto2 writes through stdio, which block-buffers on a pipe, so
+# without `stdbuf -oL` its replies never arrive and every session start blocked
+# for its whole timeout -- which, behind the sensor trigger's lock wait, meant
+# the camera took no pictures at all. Here stdbuf is hidden, so the stub
+# block-buffers exactly as the real one did.
+mod, cam2, out = fresh()
+real_which = mod.shutil.which
+mod.shutil.which = lambda n, *a, **k: None if n == "stdbuf" else real_which(n, *a, **k)
+try:
+    t0 = time.monotonic()
+    warm = cam2.warmup()                     # must refuse, and refuse FAST
+    el = time.monotonic() - t0
+    ok = (not warm) and cam2._shell_off and el < 5
+    print(f"    warmup refused in {el:.2f}s (no stdbuf -> unsynchronisable)   "
+          f"{'PASS' if ok else 'FAIL'}")
+    fails += [] if ok else ["9"]
+    t0 = time.monotonic()
+    cam2.capture(out / "z.%C")               # and captures still work
+    el2 = time.monotonic() - t0
+    ok2 = (out / "z.jpg").is_file() and el2 < 8
+    print(f"    capture still works via the proven path in {el2:.2f}s   "
+          f"{'PASS' if ok2 else 'FAIL'}")
+    fails += [] if ok2 else ["9b"]
+finally:
+    mod.shutil.which = real_which
+    cam2.shutdown()
+
+print("\n=== 10. warmup proves the session before any frame depends on it ===")
+mod, cam, out = fresh()
+t0 = time.monotonic()
+ok = cam.warmup() and cam._shell is not None
+warm_cost = time.monotonic() - t0
+t0 = time.monotonic()
+cam.capture(out / "first.%C")
+first = time.monotonic() - t0
+ok = ok and first < 1.5                      # the FIRST real frame is already fast
+print(f"    warmup {warm_cost:.2f}s, then first capture {first:.2f}s   "
+      f"{'PASS' if ok else 'FAIL'}")
+fails += [] if ok else ["10"]
 cam.shutdown()
 
 print("\n" + ("ALL PASS" if not fails else f"FAILED: {', '.join(fails)}"))

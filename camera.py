@@ -13,6 +13,7 @@ Design notes (confirmed on hardware — see CLAUDE.md):
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import threading
 import time
@@ -79,11 +80,25 @@ class ShellSession:
         self._reader: threading.Thread | None = None
 
     # -- lifecycle ----------------------------------------------------------
-    def start(self, timeout: float = 30.0) -> None:
+    def start(self, timeout: float = 12.0) -> None:
         """Spawn the shell and block until it answers, i.e. the camera is
         claimed and the PTP session is open. Raises CameraError if it won't."""
         argv = ["gphoto2", "--filename", self.filename, "--force-overwrite",
                 "--shell"]
+        # Force line buffering. gphoto2 writes with stdio, which block-buffers
+        # when stdout is a pipe, so WITHOUT this its replies — including the
+        # sentinel we synchronise on — sit in libc's buffer and never arrive.
+        # v0.1.35 shipped without it and the camera stopped taking pictures
+        # entirely: every session start blocked for its full timeout, and with
+        # the sensor trigger's lock wait on top, every slide was skipped as
+        # "camera busy". The test stub flushed explicitly, so the suite passed
+        # against a fiction. trigger.py already does exactly this for gpiomon.
+        if shutil.which("stdbuf"):
+            argv = ["stdbuf", "-oL", *argv]
+        else:
+            self._log("[camera] stdbuf not found — a persistent gphoto2 session "
+                      "cannot be synchronised reliably; not starting one")
+            raise CameraError("stdbuf unavailable (needed for line buffering)")
         try:
             self._proc = subprocess.Popen(
                 argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -256,6 +271,24 @@ class Camera:
             self._say("[camera] giving up on the persistent gphoto2 session for "
                       "this run; every capture will spawn its own process "
                       "(slower, but reliable). Restart the service to retry.")
+
+    def warmup(self) -> bool:
+        """Prove the persistent session works BEFORE any real frame depends on
+        it, and switch it off for good if it doesn't.
+
+        This is the guard v0.1.35 lacked. There, the first proof that a session
+        was impossible arrived during a capture, and paying for that discovery
+        per frame is what stopped the camera taking pictures. Call once at
+        startup, before the sensor trigger is armed."""
+        if not self._shell_usable():
+            return False
+        if self._ensure_shell(self._last_shell_cwd) is not None:
+            return True
+        self._shell_off = True
+        self._say("[camera] persistent session unavailable — every operation "
+                  "will spawn its own gphoto2 (the proven path). No frames are "
+                  "at risk; captures are just slower to the shutter.")
+        return False
 
     def set_capture_dir(self, folder) -> None:
         """Tell the camera where captures will land, before anything opens a

@@ -2659,6 +2659,11 @@ def main():
     # start, so the first capture inherits a usable session instead of paying to
     # rebuild one (gphoto2 stages downloads in its working directory).
     cam.set_capture_dir(OUT_DIR)
+    if cam.persistent:
+        # Prove it here, where failure costs nothing, rather than discovering
+        # mid-batch that this camera can't hold a session.
+        cam.warmup()
+        print(f"Fast session:    {'on' if cam._shell else 'unavailable'}")
 
     # Seed the camera-status cache BEFORE the trigger is armed, so the UI has
     # real values from the first page load. Once the trigger is running the

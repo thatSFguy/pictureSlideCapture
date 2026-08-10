@@ -569,7 +569,27 @@ commands on stdin, so process start + camlib scan + USB claim + PTP OpenSession
 are paid ONCE per run instead of before every exposure. Enabled by default;
 `--no-persist` reverts to a process per operation.
 
+**OFF by default** (`--persist` to enable). v0.1.35 shipped it on and **the
+camera stopped taking pictures entirely**; see the buffering note below. Do not
+re-enable it by default until it has run a real batch on the hardware.
+
 Things that are load-bearing, and were each a bug or a near-miss first:
+- **`stdbuf -oL` IS MANDATORY.** gphoto2 writes through stdio, which
+  block-buffers when stdout is a pipe, so without it every reply — including the
+  sentinel — sits in libc's buffer and never arrives. That was the v0.1.35
+  outage: each session start blocked for its full 30s timeout, and behind the
+  sensor trigger's 8s lock wait every slide was skipped as "camera busy". If
+  `stdbuf` is missing the session now refuses to start rather than hang.
+  `trigger.py` already did this for `gpiomon`, with a comment explaining why —
+  the lesson was in the repo and got missed anyway.
+- **The test stub must NOT flush by hand.** The original one did, the suite
+  passed, and the feature hung on hardware — the tests were a fiction. It now
+  block-buffers by default and honours `_STDBUF_O` the way libc does, so a
+  missing `stdbuf` reproduces the outage in the suite (case 9).
+- **Prove the session at startup** (`Camera.warmup()`, called from `main()`
+  before the trigger is armed) and disable it for good if it fails. v0.1.35
+  discovered impossibility *during captures* and paid for that discovery per
+  frame, which is what turned a slow path into no pictures at all.
 - **Synchronise with a sentinel, not the prompt.** The shell's prompt goes
   through readline, which may not print it at all when stdin is a pipe. Each
   command is followed by a unique BOGUS command; the shell answers
@@ -599,13 +619,14 @@ Things that are load-bearing, and were each a bug or a near-miss first:
   feature is switched off for the run — retrying a doomed session forever would
   be SLOWER than never trying (a wasted attempt plus the legacy run).
 
-**UNVERIFIED ON HARDWARE:** whether the 400D's post-capture USB re-enumeration
-kills a held session. If it does, the journal will show `[camera] persistent
-session failed …` per frame and then the give-up message, and throughput returns
-to the v0.1.34 baseline — no frames lost either way. Check
-`/api/diag → persistent_session` (`shell` vs `legacy` vs `fallbacks` counts) after
-a run. Against the stub the win is the full ~3s: first frame 3.34s to shutter,
-every one after it 0.30s.
+**STILL UNVERIFIED ON HARDWARE:** whether the 400D's post-capture USB
+re-enumeration kills a held session. The v0.1.35 outage was the buffering bug, so
+it never got far enough to answer that question. To try it, start with
+`--persist` and watch the journal: `Fast session: on` at startup, then
+`SHUTTER at +…` per frame. Check `/api/diag → persistent_session` for the
+`shell` / `legacy` / `fallbacks` counts. Against the stub the win is the full
+~3s (first frame 3.34s to shutter, every one after it 0.30s), but the stub is a
+stub — it has already been wrong once.
 
 Run (dev host):
     python3 capture_server.py            # http://localhost:8080
