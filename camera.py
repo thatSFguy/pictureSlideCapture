@@ -190,7 +190,7 @@ class Camera:
     """Controls the DSLR via the gphoto2 CLI, one subprocess per operation."""
 
     def __init__(self, retries: int = 4, backoff: float = 1.5,
-                 verbose: bool = True, persistent: bool = True):
+                 verbose: bool = True, persistent: bool = False):
         self.retries = retries
         self.backoff = backoff
         self.verbose = verbose

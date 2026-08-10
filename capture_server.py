@@ -2616,12 +2616,14 @@ def main():
                    help="BCM line wired to the sensor OUT (default %(default)s = phys pin 18)")
     p.add_argument("--sensor-active-high", action="store_true",
                    help="sensor OUT goes HIGH when obstructed (default: LOW)")
-    p.add_argument("--no-persist", action="store_true",
-                   help="disable the persistent gphoto2 session (spawn a fresh "
-                        "process per operation, as before — slower, but the "
-                        "fallback if a camera can't hold a session)")
+    p.add_argument("--persist", action="store_true",
+                   help="EXPERIMENTAL: hold one gphoto2 session open for the "
+                        "whole run instead of spawning a process per operation. "
+                        "Much faster to the shutter when it works, but OFF by "
+                        "default until it is proven on this hardware — v0.1.35 "
+                        "shipped it on and the camera stopped taking pictures.")
     args = p.parse_args()
-    cam.persistent = not args.no_persist
+    cam.persistent = args.persist
 
     OUT_DIR = Path(args.out_dir)
     OUT_DIR.mkdir(parents=True, exist_ok=True)
