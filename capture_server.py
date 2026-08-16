@@ -188,6 +188,23 @@ _CAM_STATUS_AT = 0.0          # monotonic time of that read (0 = never)
 # rides along on a capture we are already holding the lock for, and happens
 # AFTER the shutter, so it can never delay an exposure.
 STATUS_REFRESH_S = 240.0
+# Zip downloads in flight. While one is running the background status poll must
+# serve cached camera fields (same rule as an armed trigger): a big group's zip
+# pegs the Zero W's single core for minutes, a live gphoto2 status read under
+# that starvation runs into its timeout, and the timeout KILLS gphoto2 mid-PTP
+# transaction — which wedges the 400D until it is power-cycled. Seen on the
+# appliance as "every zip download loses the camera".
+_ZIP_STREAMS = 0
+_zip_streams_lock = threading.Lock()
+# Earliest monotonic time the poll may try a LIVE read to recover a cache that
+# says "no camera" (see /api/status). Boot order makes that state routine: the
+# Pi is on wall power and boots first, the camera is switched on when the
+# operator sits down — so the startup seed reads "no camera", and with the
+# trigger armed from persisted settings the poll would otherwise stay
+# cache-only forever, leaving the pill blind until a sensor capture that the
+# operator (seeing "no camera") never starts.
+_CAM_REPROBE_S = 30.0
+_next_cam_probe = 0.0
 # Shoot blind if the last capture ended longer ago than this. The 400D's
 # post-capture bus drop is ~1-2s, so 5s is already a generous margin, and if the
 # camera IS unexpectedly away, _grab's no-file retry still recovers.
@@ -1049,6 +1066,16 @@ def read_status_cached() -> dict:
             "cached_age_s": None if age is None else round(age)}
 
 
+def _cam_probe_due() -> bool:
+    """Rate-limit the disconnected-cache recovery probe (see /api/status)."""
+    global _next_cam_probe
+    now = time.monotonic()
+    if now < _next_cam_probe:
+        return False
+    _next_cam_probe = now + _CAM_REPROBE_S
+    return True
+
+
 def read_status() -> dict:
     """Light status: one batched gphoto2 call. Assumes cam_lock held."""
     global _CAM_STATUS, _CAM_STATUS_AT
@@ -1582,8 +1609,23 @@ class Handler(BaseHTTPRequestHandler):
             # background poll: it would hold cam_lock for two gphoto2 sessions
             # and a slide arriving in that window waits behind it. On this rig
             # the pusher keeps moving, so a delayed shutter is a spoiled frame.
-            if trigger is not None and trigger.enabled:
-                self._json(read_status_cached())
+            # A zip download counts like an armed trigger: a live gphoto2 read
+            # while the Zero W is pegged serving a multi-minute zip runs into
+            # its timeout, and the kill mid-PTP wedges the 400D (seen on the
+            # appliance as "every zip download loses the camera").
+            if (trigger is not None and trigger.enabled) or _ZIP_STREAMS:
+                st = read_status_cached()
+                # A cache that says "no camera" must not be trusted forever
+                # (appliance boot order: Pi up first, camera on later, trigger
+                # armed from persisted settings → poll never reads live again).
+                # While disconnected there is no healthy run to protect, so
+                # probe for real — fail-fast, rate-limited, never during a zip.
+                # One success flips connected and it is back to cache-only.
+                if (not st.get("connected") and not _ZIP_STREAMS
+                        and _cam_probe_due()):
+                    self._with_camera(read_status, wait=0)
+                else:
+                    self._json(st)
             else:
                 self._with_camera(read_status, wait=0)   # poll: fail fast, skip
         elif path == "/api/settings":
@@ -1812,34 +1854,50 @@ class Handler(BaseHTTPRequestHandler):
         extra = [f for f in extra if f.is_file()]
         # Build to a temp file on the SAME disk (not /tmp, which is tmpfs/RAM on
         # the Pi), then stream it — avoids buffering a whole batch in 512 MB RAM.
-        tmp = tempfile.NamedTemporaryFile(dir=OUT_DIR, suffix=".zip", delete=False)
+        global _ZIP_STREAMS
+        with _zip_streams_lock:
+            _ZIP_STREAMS += 1
         try:
-            with zipfile.ZipFile(tmp, "w", zipfile.ZIP_STORED) as z:
-                for f in files:
-                    z.write(f, f.name)
-                for f in extra:
-                    z.write(f, f"{brightness.ORIGINALS_DIR}/{f.name}")
-            size = tmp.tell()
-            tmp.seek(0)
-            self.send_response(200)
-            self.send_header("Content-Type", "application/zip")
-            self.send_header("Content-Length", str(size))
-            self.send_header("Content-Disposition",
-                             f'attachment; filename="{PREFIX}.zip"')
-            self.send_header("Cache-Control", "no-store")
-            self.end_headers()
-            if self.command != "HEAD":
-                while True:
-                    chunk = tmp.read(256 * 1024)
-                    if not chunk:
-                        break
-                    self.wfile.write(chunk)
-        finally:
-            tmp.close()
             try:
-                os.unlink(tmp.name)
+                # On Linux, nice() applies to just this handler thread (NPTL),
+                # and ThreadingHTTPServer gives each request a fresh thread —
+                # so only the zip is deprioritized, and a capture fired
+                # mid-download isn't starved on the Zero W's single core.
+                os.nice(10)
             except OSError:
                 pass
+            tmp = tempfile.NamedTemporaryFile(dir=OUT_DIR, suffix=".zip",
+                                              delete=False)
+            try:
+                with zipfile.ZipFile(tmp, "w", zipfile.ZIP_STORED) as z:
+                    for f in files:
+                        z.write(f, f.name)
+                    for f in extra:
+                        z.write(f, f"{brightness.ORIGINALS_DIR}/{f.name}")
+                size = tmp.tell()
+                tmp.seek(0)
+                self.send_response(200)
+                self.send_header("Content-Type", "application/zip")
+                self.send_header("Content-Length", str(size))
+                self.send_header("Content-Disposition",
+                                 f'attachment; filename="{PREFIX}.zip"')
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                if self.command != "HEAD":
+                    while True:
+                        chunk = tmp.read(256 * 1024)
+                        if not chunk:
+                            break
+                        self.wfile.write(chunk)
+            finally:
+                tmp.close()
+                try:
+                    os.unlink(tmp.name)
+                except OSError:
+                    pass
+        finally:
+            with _zip_streams_lock:
+                _ZIP_STREAMS -= 1
 
 
 # ---- the page (single embedded file) -------------------------------------

@@ -276,7 +276,13 @@ Files (all in repo root; stdlib only, with one OPTIONAL apt dependency —
     copies ride along under `originals/` in the archive; without that,
     download-all + delete-all would silently discard them and bake every
     brightness correction in permanently. `?originals=0` opts out (halves the
-    zip when every frame was corrected).
+    zip when every frame was corrected). **A zip in flight suppresses live
+    camera reads** (`_ZIP_STREAMS`): a multi-minute zip pegs the Zero W's
+    single core, a live gphoto2 status read under that starvation hits its
+    timeout, and the kill mid-PTP wedges the 400D until power-cycled — seen on
+    hardware as "every zip download loses the camera". The status poll serves
+    cache while a zip streams, and the zip handler thread is `os.nice(10)`d so
+    a capture fired mid-download isn't starved.
   - `GET /api/exposure?name=` — on-demand exposure stats for an image
 - `brightness.py` — **digital brightness correction** (the fixed-backlight fix).
   Slide density varies per frame and the light pad can't be re-dialed per shot,
@@ -540,6 +546,15 @@ nothing else ever called `read_status`. The cache is now seeded at startup
 (before the trigger is armed) and topped up by `_refresh_cam_status()`, which
 rides on a capture whose lock we already hold and runs **after the shutter**, so
 it can never delay an exposure. `STATUS_REFRESH_S`=240s.
+**A disconnected cache must be allowed to recover.** Settings persistence
+re-arms the trigger at boot, and the appliance boot order is Pi-first,
+camera-later — so the startup seed reads "no camera" and the cache-only poll
+had no path back (pill blind until a sensor capture the operator, seeing "no
+camera", never starts). Second hardware regression of this pill. Now, when the
+cached status says NOT connected, the poll does a live fail-fast read, rate-
+limited to one per `_CAM_REPROBE_S`=30s and never during a zip — safe because
+a disconnected camera means there is no healthy run to protect; one success
+flips it back to cache-only.
 
 **Measured breakdown (appliance, v0.1.33, 12 sensor frames, 2026-08-09):**
 edge→shutter mean **4.71s** (3.05–5.16). Of that, `probe` was 1.62s mean and the
