@@ -257,6 +257,16 @@ Files (all in repo root; stdlib only, with one OPTIONAL apt dependency —
   - `POST /api/deleteall` — delete the whole current group + RAW siblings and
     clear its caption/exposure caches (prefix-guarded so a stale tab can't wipe
     the wrong group); Review "Delete all" button, for clearing after download
+  - `GET /api/groups` — scan `OUT_DIR` for every group on disk (prefix, image/
+    file counts, newest mtime). Exists because renaming the group prefix
+    ORPHANS the old group's files: still on disk, invisible to every
+    prefix-scoped view. Setup shows the list (Groups on this device) with
+    **Open** (switches the prefix, so Review/zip/delete-all work on it) and 🗑.
+  - `POST /api/deletegroup` — delete a whole group BY NAME, current or not
+    (files + RAW siblings + pre-correction originals + caption/exposure cache
+    entries, via the shared `delete_group()` also used by deleteall). Guarded:
+    the name must exactly match a scanned group AND survive `sanitize_prefix`
+    unchanged (keeps glob metacharacters out), else 404 and nothing deleted.
   - `GET /media/<file>` (path-traversal guarded; `?dl=1` forces download,
     `?orig=1` serves the pre-correction copy from `captures/originals/`)
   - `GET /thumb/<file>` — tiny embedded EXIF thumbnail (fast Review grid)

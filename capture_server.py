@@ -429,6 +429,56 @@ def recent_images(prefix: str, limit: int = 24) -> list[str]:
     return [f.name for f in group_images(prefix)[:limit]]
 
 
+# Any image/RAW file named <prefix>_NNNN.<ext>, capturing the prefix. Greedy, so
+# "trip_1972_0001.jpg" groups under "trip_1972" — matching next_index()'s view.
+GROUP_RE = re.compile(r"^(.+)_\d{4,}\.", re.IGNORECASE)
+
+
+def list_groups() -> list[dict]:
+    """Every group on disk, newest first. Changing the group name orphans the
+    old group's files — still on disk but invisible to a UI that only queries
+    the current prefix — so managing them needs a scan, not the current name."""
+    groups: dict[str, dict] = {}
+    for f in OUT_DIR.iterdir():
+        ext = f.suffix.lower()
+        if not f.is_file() or ext not in IMAGE_EXTS | RAW_EXTS:
+            continue
+        m = GROUP_RE.match(f.name)
+        if not m:
+            continue
+        g = groups.setdefault(m.group(1), {"prefix": m.group(1), "count": 0,
+                                           "files": 0, "mtime": 0})
+        g["files"] += 1
+        if ext in IMAGE_EXTS:
+            g["count"] += 1
+        g["mtime"] = max(g["mtime"], _mtime(f))
+    return sorted(groups.values(), key=lambda g: -g["mtime"])
+
+
+def delete_group(prefix: str) -> list[str]:
+    """Remove every file in a group — images, RAW siblings, stashed
+    pre-correction originals — and drop its caption/exposure cache entries."""
+    rx = name_re(prefix)
+    removed = []
+    for f in sorted(OUT_DIR.glob(f"{prefix}_*")):
+        if not rx.match(f.name):
+            continue
+        try:
+            brightness.discard_original(f)     # pre-correction copy, if any
+            f.unlink()
+            removed.append(f.name)
+        except OSError:
+            pass
+    if removed:                                # reset the sidecar caches
+        caps = load_captions()
+        if any(caps.pop(r, None) is not None for r in removed):
+            save_captions(caps)
+        ex = load_exposure()
+        if any(ex.pop(r, None) is not None for r in removed):
+            save_exposure(ex)
+    return removed
+
+
 def friendly(err: str) -> str:
     low = err.lower()
     if "no camera found" in low or "could not find" in low:
@@ -1569,6 +1619,8 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError:
                 offset, limit = 0, 60
             self._json(read_images(offset, limit))
+        elif path == "/api/groups":
+            self._json({"ok": True, "current": PREFIX, "groups": list_groups()})
         elif path.startswith("/thumb/"):
             self._serve_thumb(unquote(path[len("/thumb/"):]))
         elif path.startswith("/media/"):
@@ -1609,6 +1661,8 @@ class Handler(BaseHTTPRequestHandler):
             self._json(start_install(self._body().get("feature", "")))
         elif path == "/api/deleteall":
             self._delete_all(self._body().get("prefix", ""))
+        elif path == "/api/deletegroup":
+            self._delete_group(self._body().get("prefix", ""))
         elif path == "/api/debugcapture":
             self._with_camera(debug_capture, wait=15)   # diagnostic (alpha)
         elif path == "/api/update":
@@ -1707,24 +1761,22 @@ class Handler(BaseHTTPRequestHandler):
         if sanitize_prefix(prefix) != PREFIX:
             return self._json({"ok": False, "error": "prefix mismatch — reload "
                                "and try again"}, 409)
-        removed = []
-        for img in group_images(PREFIX):
-            for sib in OUT_DIR.glob(img.stem + ".*"):   # jpg + cr2 sibling
-                try:
-                    brightness.discard_original(sib)    # + pre-correction copy
-                    sib.unlink()
-                    removed.append(sib.name)
-                except OSError:
-                    pass
-        if removed:                                # reset the sidecar caches
-            caps = load_captions()
-            if any(caps.pop(r, None) is not None for r in removed):
-                save_captions(caps)
-            ex = load_exposure()
-            if any(ex.pop(r, None) is not None for r in removed):
-                save_exposure(ex)
+        removed = delete_group(PREFIX)
         self._json({"ok": True, "removed": len(removed),
                     "count": image_count(PREFIX)})
+
+    def _delete_group(self, prefix: str):
+        """Delete a whole group BY NAME, including one that is no longer
+        current — changing the group name orphans the old files (invisible in
+        the UI, still on disk). Guarded: the name must exactly match a group
+        that exists on disk, so a typo or stale tab deletes nothing; the
+        sanitize check also keeps glob metacharacters out of delete_group."""
+        if (not prefix or sanitize_prefix(prefix) != prefix
+                or not any(g["prefix"] == prefix for g in list_groups())):
+            return self._json({"ok": False, "error": "no such group"}, 404)
+        removed = delete_group(prefix)
+        self._json({"ok": True, "prefix": prefix, "removed": len(removed),
+                    "current": PREFIX, "groups": list_groups()})
 
     def _caption(self, body: dict):
         name = body.get("name", "")
@@ -1849,6 +1901,15 @@ INDEX_HTML = r"""<!doctype html>
               border-radius:10px; padding:.6rem; text-align:center; }
   #testImg { max-width:100%; max-height:44vh; border-radius:6px; display:none; margin-top:.5rem; }
   .note { font-size:.72rem; color:#777; margin-top:.4rem; }
+  .grplist { margin-top:.6rem; display:flex; flex-direction:column; gap:.3rem; }
+  .grow { display:flex; align-items:center; gap:.5rem; background:#111;
+          border:1px solid #2a2a2a; border-radius:8px; padding:.3rem .6rem;
+          font-size:.85rem; }
+  .grow .gname { flex:1; min-width:0; overflow-wrap:anywhere; }
+  .grow .gcount { color:#888; font-size:.75rem; white-space:nowrap; }
+  .grow button { border:none; border-radius:6px; color:#fff; cursor:pointer;
+                 padding:.3rem .6rem; font-size:.8rem; background:#2f7bd6; }
+  .grow button.gdel { background:#5a1a1a; }
   .grid2 { display:grid; grid-template-columns:1fr 1fr; gap:.5rem; }
   .diagrow { display:flex; gap:.5rem; flex-wrap:wrap; margin-top:.7rem; }
   #diagBtn, #logBtn { background:#333; border:none; border-radius:8px; color:#fff;
@@ -1957,6 +2018,10 @@ INDEX_HTML = r"""<!doctype html>
         </div>
         <div class="note">Saved as <code><span id="pfxEx">slide</span>_0001</code>, _0002, …
           (written into each image's metadata).</div>
+        <div id="grpList" class="grplist"></div>
+        <div class="note" id="grpListNote" style="display:none">All groups on this
+          device — a renamed group's files stay here. <b>Open</b> switches to a
+          group (Review shows it); 🗑 deletes its files.</div>
       </div>
       <div class="card">
         <h3>3 · Fine-tune exposure</h3>
@@ -2133,7 +2198,7 @@ function setMode(m){
   document.querySelectorAll('.view').forEach(v=>v.classList.remove('active'));
   $('#view-'+m).classList.add('active');
   document.querySelectorAll('nav button').forEach(b=>b.classList.toggle('active',b.dataset.mode===m));
-  if(m==='setup'){ loadSettings(); loadVersion(); loadTrigger(); }
+  if(m==='setup'){ loadSettings(); loadVersion(); loadTrigger(); loadGroups(); }
   if(m==='review') loadReview(true);
   if(m==='capture'){ capIdx=0; renderCap(); }
 }
@@ -2227,7 +2292,42 @@ async function loadSettings(){
 async function applyField(field,val){ const d=await jpost('/api/settings',{[field]:val});
   if(d.connected===false) toast(d.error||'could not apply','err'); else { toast(field+' = '+val,'ok'); status(); } }
 async function applyPrefix(){ await jpost('/api/settings',{prefix:$('#prefix').value});
-  await status(); $('#prefix').value=ST.prefix; toast('Group: '+ST.prefix,'ok'); }
+  await status(); $('#prefix').value=ST.prefix; toast('Group: '+ST.prefix,'ok'); loadGroups(); }
+/* Groups on this device: renaming the prefix orphans the old group's files —
+   still on disk but invisible to the prefix-scoped views — so Setup lists every
+   group found on disk with open/delete controls. */
+async function loadGroups(){
+  let d; try{ d=await jget('/api/groups'); }catch(e){ return; }
+  renderGroups(d.groups||[], d.current);
+}
+function renderGroups(groups, current){
+  const el=$('#grpList'); el.innerHTML='';
+  $('#grpListNote').style.display = groups.length ? 'block' : 'none';
+  groups.forEach(g=>{
+    const row=document.createElement('div'); row.className='grow';
+    const cur=g.prefix===current, n=g.count||g.files;
+    row.innerHTML='<span class="gname">'+g.prefix.replace(/</g,'&lt;')
+      +(cur?' <span class="pill good">current</span>':'')+'</span>'
+      +'<span class="gcount">'+n+(g.count?' image':' file')+(n===1?'':'s')+'</span>';
+    if(!cur){ const b=document.createElement('button'); b.textContent='Open';
+      b.onclick=()=>openGroup(g.prefix); row.appendChild(b); }
+    const del=document.createElement('button'); del.className='gdel'; del.textContent='🗑';
+    del.title='Delete this group'; del.onclick=()=>deleteGroup(g); row.appendChild(del);
+    el.appendChild(row);
+  });
+}
+async function openGroup(p){ await jpost('/api/settings',{prefix:p});
+  await status(); $('#prefix').value=ST.prefix; toast('Group: '+ST.prefix,'ok'); loadGroups(); }
+async function deleteGroup(g){
+  const n=g.count||g.files;
+  if(!confirm('Delete group “'+g.prefix+'” — ALL '+n+(g.count?' image':' file')+(n===1?'':'s')
+    +' (plus any RAW siblings and pre-correction originals)?\n'
+    +'This cannot be undone — download first if you want to keep them.')) return;
+  const d=await jpost('/api/deletegroup',{prefix:g.prefix});
+  if(d.ok){ toast('Deleted '+d.removed+' file'+(d.removed===1?'':'s'),'ok');
+    renderGroups(d.groups||[], d.current); status(); }
+  else toast(d.error||'delete failed','err');
+}
 async function preset(name){ const d=await jpost('/api/preset',{name});
   if(d.connected===false||d.ok===false){ toast(d.error||'preset failed','err'); return; }
   toast(name+' defaults set — fine-tune shutter','ok'); loadSettings(); status(); }
