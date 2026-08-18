@@ -24,6 +24,10 @@ Python web app** (`capture_server.py`) that talks to the camera via `gphoto2`
 and serves a phone/tablet/desktop UI. No live view on the target camera (Canon
 EOS 400D / Rebel XTi), so the workflow is shoot → review, optimized for volume.
 
+In production it ran fully hands-free: a continuously running motor pushes each
+new slide into place, and an optical switch fires the capture as it arrives —
+see [Optical sensor trigger](#optical-sensor-trigger-optional) for the mechanism.
+
 ## Requirements
 
 - Linux host (dev machine now; a Raspberry Pi later). macOS works too.
@@ -133,12 +137,21 @@ exposure aid. Focus once, manually, on the film plane. Full rationale in
 
 ## Optical sensor trigger (optional)
 
-Instead of pressing Capture, you can wire a 3-pin optical sensor (IR break-beam
-or photo-interrupter) so a slide dropping into position fires the shot
-automatically (`trigger.py`, off by default). This is how the author's slide
-collection was actually scanned: a continuously running rotary pusher feeds
-slides, the arm trips the sensor each revolution, and the rig captures
-hands-free for hours — hundreds of slides per session with no browser open.
+The production rig runs fully hands-free, and the division of labor is simple:
+
+- **The motor just runs.** A continuously running motor — its own power supply
+  and a manual speed knob; the Pi neither powers nor controls it — turns a
+  rotary arm that pushes the next slide into place in front of the lens,
+  revolution after revolution.
+- **An optical switch takes the picture.** A 3-pin break-beam sensor is tripped
+  once per revolution as the arm passes; that edge is the capture trigger —
+  beam blocked → shot fired (`trigger.py`, off by default).
+
+The pace is therefore set on the motor's speed knob, not in software: turn it
+down until the camera's sensor-to-shutter latency reliably beats the arm coming
+around to push the next slide in. Run that way, the rig captured hundreds of
+slides per session for hours with no browser open — that's how the author's
+whole collection was scanned.
 
 ### Wiring — Raspberry Pi 40-pin header
 
@@ -214,39 +227,32 @@ correction.
 
 ## Roadmap
 
+**The project is done.** It accomplished what it was built for — the author's
+35mm slide collection is digitized — and is now in maintenance mode. No further
+development is planned.
+
+What it delivered:
+
 - [x] Camera tethering + full-res capture over USB
-- [x] Web capture app: presets, exposure aid, captions, review/cull, export,
-      group management
-- [x] Raspberry Pi appliance deploy kit (`deploy/`) — proven on hardware
-- [x] CI image build (GitHub Actions → flashable `.img` on tag/Release)
-- [ ] Speed up CI: native ARM runners instead of QEMU (~30 min → a few min);
-      gated on cost for a private repo, so revisit when public
+- [x] Web capture app: presets, exposure aid, digital brightness correction,
+      captions, review/cull, export, group management
+- [x] Raspberry Pi flash-and-go appliance: CI-built SD image, Comitup WiFi
+      provisioning, in-app self-update and diagnostics — no SSH needed
 - [x] Physical rig: high-CRI backlight, rotary slide pusher (continuously
-      running motor, manual speed control), optical break-beam sensor
-- [x] First hardware shakedown of the Pi deploy (Comitup AP flow, real capture)
-- [x] Web-based self-update: a button in the UI that pulls the latest release
-      and restarts the service (no SSH needed on the appliance)
-- [x] **Production: the author's 35mm slide collection digitized end-to-end** —
-      multi-hour hands-free sensor-triggered sessions on the appliance, with
-      digital brightness correction cleaning up the dense frames
-- [ ] Negatives production run: presets + RAW pipeline are built but haven't
-      been used in anger yet
-- [ ] Security hardening before going public: attack-surface review of the web
-      app, remove SSH from the appliance (reflash-on-failure is the recovery
-      path), scope sudo to a command allowlist, default-deny inbound firewall
-- [ ] First-connect trust prompt: choose **Trusted home network** (no login) vs
-      **Shared/untrusted** (set an access PIN → hashed, signed session cookie,
-      all stdlib) — the clean fix for the currently-open web UI
-- [ ] Serve on the default **port 80**: fold WiFi provisioning into the app
-      (`nmcli`/Comitup API) and drop `comitup-web`, so one service on one port
-      does setup + scanning (also shrinks attack surface). Until then, an
-      `slidescanner.local` QR-code bookmark hides the `:8080`.
-- [x] Optical-sensor capture trigger (`trigger.py`): proven in production —
-      it ran the entire slide-collection scan
-- [ ] Auto slide-advance (`advance.py`): stub + API done, but the production
-      rig ended up not needing it — a continuously running motor with a manual
-      speed controller feeds slides and the sensor does the rest. Kept for a
-      future Pi-controlled feeder.
-- [ ] Automated XY gantry (GRBL) for batch-scanning negative strips
-      (`scanner.py`) — the likely next phase if negatives get the same
-      hands-free treatment
+      running motor with a manual speed knob — not Pi-controlled), optical
+      break-beam capture trigger
+- [x] **Production: the whole slide collection scanned end-to-end** —
+      multi-hour hands-free sensor-triggered sessions, hundreds of slides per
+      session, brightness correction cleaning up the dense frames
+
+Not planned (left here in case the project is ever picked back up):
+
+- Negatives production run — the presets + RAW pipeline are built and should
+  work, but never got used in anger
+- Auto slide-advance (`advance.py`) — stub + API exist, but the production rig
+  proved it unnecessary: the free-running motor plus the optical switch cover it
+- Automated XY gantry (GRBL, `scanner.py`) — was the plan for negative strips
+- Security hardening (auth/PIN, sudo allowlist, firewall, port 80) — only
+  matters if the app ever serves an untrusted network; today it's a trusted
+  home LAN behind NAT
+- CI on native ARM runners instead of QEMU
