@@ -30,11 +30,8 @@ see [Optical sensor trigger](#optical-sensor-trigger-optional) for the mechanism
 
 ## The rig in action
 
-<!-- To embed the demo: edit this file on github.com, delete the placeholder
-     line below, and drag rig-demo.mp4 (repo root, git-ignored) onto this spot.
-     GitHub uploads it as an attachment asset and the bare URL on its own line
-     renders an inline video player. Committed video files do NOT play inline,
-     which is why the mp4 itself stays out of git. -->
+https://github.com/user-attachments/assets/5fd9c2e0-e4c6-4333-81f3-d29baf97b7d2
+
 *Demo video: the rotary pusher feeding slides while the sensor fires each
 capture — embed pending.*
 
