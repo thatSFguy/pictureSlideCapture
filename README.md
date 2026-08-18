@@ -240,17 +240,16 @@ Everything printed for the feeder and camera rig is in
 (`.FCStd`), so any dimension can be tweaked for your own camera, motor, or
 light before printing.
 
-<p align="center"><img src="docs/printed-parts.png"
-  alt="The ten printed parts: Hopper, Conveyor, Pusher, Pusher Arm 70mm, Motor Arm, Motor mount, Camera mount, Lens support, Light standoff, Rod support"></p>
+<p align="center"><img src="docs/printed-parts.png" width="760"
+  alt="The nine printed parts: Hopper, Conveyor, Pusher, Pusher Arm 70mm, Motor Arm, Camera mount, Lens support, Light standoff, Rod support"></p>
 
 | Part | Role |
 |------|------|
 | Hopper | Holds the stack of slides waiting to be fed |
-| Conveyor | The track the slides travel along, over the backlight |
+| Conveyor | The track the slides travel along, over the backlight — the drive motor mounts directly to it |
 | Motor Arm | The crank on the motor shaft — this is also what sweeps past the optical sensor once per revolution |
 | Pusher Arm 70mm | Connecting link from the crank to the pusher |
 | Pusher | The plate that shoves the next slide out of the hopper and into place |
-| Motor mount | Carries the drive motor |
 | Camera mount / Rod support | Hold the DSLR on its support rod above the film plane |
 | Lens support | Steadies the lens barrel |
 | Light standoff | Spaces the backlight below the conveyor |
