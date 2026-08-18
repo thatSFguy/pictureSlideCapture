@@ -233,6 +233,28 @@ gpiomon -c gpiochip0 -e falling 24    # block/clear the beam → an event per ed
 
 On older **v1** it's `gpioget gpiochip0 24` / `gpiomon --falling-edge gpiochip0 24`.
 
+## 3D-printed parts
+
+Everything printed for the feeder and camera rig is in
+[`3D_Files/`](3D_Files/): ready-to-slice **STLs** plus the **FreeCAD sources**
+(`.FCStd`), so any dimension can be tweaked for your own camera, motor, or
+light before printing.
+
+<p align="center"><img src="docs/printed-parts.png"
+  alt="The ten printed parts: Hopper, Conveyor, Pusher, Pusher Arm 70mm, Motor Arm, Motor mount, Camera mount, Lens support, Light standoff, Rod support"></p>
+
+| Part | Role |
+|------|------|
+| Hopper | Holds the stack of slides waiting to be fed |
+| Conveyor | The track the slides travel along, over the backlight |
+| Motor Arm | The crank on the motor shaft — this is also what sweeps past the optical sensor once per revolution |
+| Pusher Arm 70mm | Connecting link from the crank to the pusher |
+| Pusher | The plate that shoves the next slide out of the hopper and into place |
+| Motor mount | Carries the drive motor |
+| Camera mount / Rod support | Hold the DSLR on its support rod above the film plane |
+| Lens support | Steadies the lens barrel |
+| Light standoff | Spaces the backlight below the conveyor |
+
 ## Files
 
 | File | Role |
@@ -245,6 +267,7 @@ On older **v1** it's `gpioget gpiochip0 24` / `gpiomon --falling-edge gpiochip0 
 | `trigger.py` | Optical-sensor capture trigger: auto-captures on the beam-blocked edge, polarity configurable; default off |
 | `scanner.py` | Gantry dead-reckoning batch loop (deferred automation phase) |
 | `CLAUDE.md` | Detailed hardware, protocol, and development notes |
+| `3D_Files/` | Printable parts for the feeder + camera rig (STL + FreeCAD sources) |
 
 Captured images and per-group sidecars (`captions.json`, `exposure.json`,
 `config.json`) are written under `captures/` and are git-ignored, as is
