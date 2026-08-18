@@ -32,8 +32,8 @@ see [Optical sensor trigger](#optical-sensor-trigger-optional) for the mechanism
 
 https://github.com/user-attachments/assets/5fd9c2e0-e4c6-4333-81f3-d29baf97b7d2
 
-*Demo video: the rotary pusher feeding slides while the sensor fires each
-capture — embed pending.*
+*The rotary pusher feeding slides while the sensor fires each capture —
+fully hands-free.*
 
 ## Requirements
 
