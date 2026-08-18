@@ -2614,6 +2614,9 @@ async function loadReview(reset){
   const d=await jget('/api/images?offset='+rev.offset+'&limit='+rev.limit);
   rev.total=d.total; rev.items=rev.items.concat(d.items); rev.offset=rev.items.length;
   rev._sig=revSig(rev.items);
+  // The server names the group authoritatively; ST.prefix may still be the
+  // page-load default if Review renders before the first status() returns.
+  if(d.prefix) ST.prefix=d.prefix;
   renderGrid();
 }
 // Keep Review live without a manual refresh: while it's the active view, re-poll
@@ -2749,7 +2752,11 @@ document.addEventListener('keydown', e=>{
   }catch(e){ /* History API unavailable — nothing to guard */ }
 })();
 
-setMode('setup'); status(); setInterval(status, 15000);
+/* Deep-link a mode with ?mode=capture|review (e.g. a tablet bookmark straight
+   into the capture loop); anything else lands on Setup as before. */
+const _m0=new URLSearchParams(location.search).get('mode');
+setMode(['setup','capture','review'].includes(_m0)?_m0:'setup');
+status(); setInterval(status, 15000);
 setInterval(syncReview, 4000);                       // keep Review live
 window.addEventListener('focus', syncReview);
 document.addEventListener('visibilitychange', ()=>{ if(!document.hidden) syncReview(); });

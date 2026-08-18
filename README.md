@@ -94,6 +94,30 @@ flashed image.) Requires the Pi to have internet access.
   frames, caption/delete/download individual images, download the whole group
   as a zip, or clear the group once it's safely downloaded.
 
+> Tip: `?mode=capture` / `?mode=review` in the URL deep-links a mode — handy as
+> a tablet bookmark straight into the capture loop.
+
+**Setup** — presets, group manager, exposure, test shot, sensor trigger and
+brightness correction:
+
+<p align="center"><img src="docs/ui-setup.png" width="760"
+  alt="Setup mode: presets, group name + group list, exposure dropdowns, test shot, system, sensor trigger, brightness correction"></p>
+
+**Capture** — the whole loop on one screen: last shot, exposure verdict, count,
+one big button (or the spacebar, or the optical sensor):
+
+<p align="center"><img src="docs/ui-capture.png" width="760"
+  alt="Capture mode: large last-shot preview with exposure chip, running count, Capture and Redo-last buttons"></p>
+
+**Review** — the grid with per-frame exposure dots and captions:
+
+<p align="center"><img src="docs/ui-review.png" width="760"
+  alt="Review mode: thumbnail grid with exposure flags, captions, flagged-only filter, zip download and delete-all"></p>
+
+*(Screenshots show a demo group served by the app on a dev machine — a stub
+camera and generated placeholder images, since the real scans belong to the
+family album.)*
+
 ### Keyboard shortcuts
 
 | Key | Action |
