@@ -10,6 +10,11 @@ __pycache__/
 *.bak
 scratchpad/
 
+# Demo videos: too big for git history — the README embed is uploaded through
+# GitHub's web editor instead (see README "The rig in action")
+*.mp4
+*.mov
+
 # CI-staged SSH public key (injected from the SSH_AUTHORIZED_KEYS repo variable)
 deploy/authorized_keys
 

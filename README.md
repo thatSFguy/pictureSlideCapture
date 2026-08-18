@@ -28,6 +28,16 @@ In production it ran fully hands-free: a continuously running motor pushes each
 new slide into place, and an optical switch fires the capture as it arrives —
 see [Optical sensor trigger](#optical-sensor-trigger-optional) for the mechanism.
 
+## The rig in action
+
+<!-- To embed the demo: edit this file on github.com, delete the placeholder
+     line below, and drag rig-demo.mp4 (repo root, git-ignored) onto this spot.
+     GitHub uploads it as an attachment asset and the bare URL on its own line
+     renders an inline video player. Committed video files do NOT play inline,
+     which is why the mp4 itself stays out of git. -->
+*Demo video: the rotary pusher feeding slides while the sensor fires each
+capture — embed pending.*
+
 ## Requirements
 
 - Linux host (dev machine now; a Raspberry Pi later). macOS works too.
