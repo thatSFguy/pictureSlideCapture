@@ -35,44 +35,36 @@ https://github.com/user-attachments/assets/5fd9c2e0-e4c6-4333-81f3-d29baf97b7d2
 *The rotary pusher feeding slides while the sensor fires each capture —
 fully hands-free.*
 
-## Requirements
+## What you need
 
-- Linux host (dev machine now; a Raspberry Pi later). macOS works too.
-- [`gphoto2`](http://gphoto.org/) — `sudo apt install gphoto2`
-- Python 3 (standard library only — **nothing to `pip install`**)
-- Optional: `python3-pil` (`sudo apt install python3-pil`) for automatic
-  brightness correction; without it that feature reports itself unavailable and
-  everything else runs unchanged.
-- Optional: `exiftool` (`sudo apt install libimage-exiftool-perl`) for full EXIF
-  metadata; without it the app writes a JPEG comment instead.
-- A Canon DSLR supported by gphoto2. On the 400D: set **Communication → PC
-  connection** and the mode dial to **M**.
+- A **64-bit-capable Raspberry Pi** (Pi Zero 2 W or newer — the Zero 2 W is the
+  reference target), a microSD card, and power. The image is 64-bit (arm64),
+  so the single-core ARMv6 Pi Zero W / Pi 1 won't boot it.
+- A **Canon DSLR supported by gphoto2** (built and proven on the EOS 400D /
+  Rebel XTi) and a USB OTG cable/adapter for the Pi.
+- A **high-CRI backlight** under the film, and — for the hands-free feeder —
+  the [3D-printed parts](#3d-printed-parts), a small DC motor, and an optical
+  break-beam sensor.
 
-## Quick start
+No Pi? The app also runs on any Linux/macOS machine — see
+[Appendix B](#appendix-b--running-on-a-laptop-instead).
 
-```bash
-sudo apt install gphoto2
-python3 capture_server.py            # then open http://localhost:8080
-```
+## Quick start — flash the appliance
 
-Options: `--port 8080`, `--out-dir ./captures`, `--prefix trip72`, `--no-setup`.
+1. Download the latest `slidescanner-*-arm64.img.xz` from
+   [Releases](https://github.com/thatSFguy/pictureSlideCapture/releases) and
+   flash it to the SD card with Raspberry Pi Imager.
+2. On the camera: set **Communication → PC connection**, the mode dial to
+   **M**, and disable auto power-off (an AC dummy-battery coupler beats a
+   decades-old battery for long sessions).
+3. Boot the Pi. On first boot it raises a **`slidescanner-XXXX`** WiFi access
+   point — join it from your phone and enter your home WiFi details.
+4. The Pi reconnects to your network. Plug the camera into the Pi, open
+   **`http://slidescanner.local:8080`** from any phone/tablet/laptop on the
+   LAN, and scan.
 
-### Deploy as an appliance (Raspberry Pi Zero 2 W)
-
-Build a configured SD-card image **once** (`deploy/setup_pi.sh` installs gphoto2,
-camera permissions, Comitup for WiFi provisioning, and the systemd service),
-then it's **flash-and-go**: plug in the Pi → it raises a `slidescanner-XXXX`
-WiFi AP → enter your network → it reconnects → scan at
-`http://slidescanner.local:8080`. Full two-phase guide in
-[`deploy/DEPLOY.md`](deploy/DEPLOY.md).
-
-Prebuilt appliance images are attached to
-[Releases](https://github.com/thatSFguy/pictureSlideCapture/releases) — flash the
-latest `slidescanner-*-arm64.img.xz` with Raspberry Pi Imager.
-
-> **Minimum board: a 64-bit-capable Pi (Pi Zero 2 W or newer).** The image is
-> **64-bit (arm64)**, so the single-core ARMv6 Pi Zero W / Pi 1 are no longer
-> supported. The Zero 2 W is the reference target.
+Prefer to build the SD image yourself? See
+[Appendix A](#appendix-a--building-the-sd-image-yourself).
 
 ### Updating
 
@@ -309,3 +301,39 @@ Not planned (left here in case the project is ever picked back up):
   matters if the app ever serves an untrusted network; today it's a trusted
   home LAN behind NAT
 - CI on native ARM runners instead of QEMU
+
+## Appendix A — Building the SD image yourself
+
+The prebuilt Release images are produced by CI (GitHub Actions builds a
+flashable `.img` on every tag), and the same kit runs locally:
+`deploy/setup_pi.sh` installs gphoto2, camera permissions, Comitup for WiFi
+provisioning, and the systemd service into a stock Raspberry Pi OS Lite image.
+The full two-phase guide is in [`deploy/DEPLOY.md`](deploy/DEPLOY.md).
+
+Note the in-app self-update only ships app code — changes to the OS image or
+provisioning need a freshly built (or freshly downloaded) image.
+
+## Appendix B — Running on a laptop instead
+
+Any Linux machine works, and macOS too (Windows doesn't — gphoto2 has no
+Windows port, which is much of why the Pi appliance exists). You need:
+
+- [`gphoto2`](http://gphoto.org/) — `sudo apt install gphoto2`
+- Python 3 (standard library only — **nothing to `pip install`**)
+- Optional: `python3-pil` (`sudo apt install python3-pil`) for automatic
+  brightness correction; without it that feature reports itself unavailable and
+  everything else runs unchanged.
+- Optional: `exiftool` (`sudo apt install libimage-exiftool-perl`) for full EXIF
+  metadata; without it the app writes a JPEG comment instead.
+
+```bash
+sudo apt install gphoto2
+python3 capture_server.py            # then open http://localhost:8080
+```
+
+Options: `--port 8080`, `--out-dir ./captures`, `--prefix trip72`, `--no-setup`.
+
+The camera-menu settings from the Quick start (PC connection, dial on **M**,
+auto power-off disabled) apply here too. The optical sensor trigger and the
+GPIO wiring are Pi-only — on a laptop you capture with the button, the
+spacebar, or `?mode=capture` bookmarked on a tablet.
