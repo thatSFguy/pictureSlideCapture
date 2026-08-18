@@ -741,6 +741,14 @@ Notes / gotchas learned:
   `[capture]`/`[post]` sub-timings so the cycle can be measured, not guessed.
   **Not yet re-run on hardware** — the numbers to check next are `probe=` (should
   be 0.0 in steady state) and `tail=`, which sets the right `cooldown_s`.
+- [DONE 2026-08-18] **Slide collection fully digitized.** The rig's original
+  mission is complete: the whole 35mm slide collection was scanned in
+  production, hands-free via the sensor trigger. Remaining capture work would
+  be the negatives workflow (built, never production-run) and the deferred
+  gantry. Late fixes that got it over the line: group management (v0.1.38,
+  renamed groups were stranding files) and v0.1.39 (zip downloads were wedging
+  the camera via starved status polls; camera pill couldn't recover from a
+  boot-order "no camera" cache).
 - [TODO] Exposure/quality polish: tighter framing to drop the black mount
   border (more resolution + accurate metering), optional custom WB off the
   light pad (slides read slightly blue). Remove the temporary `/api/debugcapture`.

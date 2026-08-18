@@ -1,17 +1,20 @@
 # Film Scanning Rig
 
 > ## ⚠️ Alpha
-> Early and under active development. It works end-to-end on the author's setup
-> (Canon EOS 400D on a Raspberry Pi Zero 2 W), but it's been tested on exactly one
-> camera and rig, has **no authentication** (designed for a trusted home LAN),
-> and interfaces may change. Use at your own risk; expect rough edges.
+> It has completed a real production run end-to-end on the author's setup
+> (Canon EOS 400D on a Raspberry Pi appliance), but it's been tested on exactly
+> one camera and rig, has **no authentication** (designed for a trusted home
+> LAN), and interfaces may change. Use at your own risk; expect rough edges.
 
 Digitize 35mm slides and negatives with a tethered Canon DSLR — a web app you
 drive from any browser to place a slide, capture it, and review the batch.
 
-> **Status:** manual capture app is working (including a Raspberry Pi flash-and-go
-> appliance with in-app updates); the automated XY gantry is deferred until the
-> manual workflow is proven. See [CLAUDE.md](CLAUDE.md) for hardware/dev notes.
+> **Status:** proven in production — the author's 35mm slide collection has been
+> fully digitized with this rig (hands-free sensor-triggered batches on the Pi
+> appliance, hundreds of slides per session). The negatives workflow (RAW preset,
+> inversion-ready files) is built but hasn't had a production run yet, and the
+> automated XY gantry is deferred. See [CLAUDE.md](CLAUDE.md) for hardware/dev
+> notes.
 
 ## What it is
 
@@ -71,12 +74,14 @@ flashed image.) Requires the Pi to have internet access.
 
 - **Setup** (once per batch): pick **Slides** or **Negatives** preset, set a
   group name, fine-tune exposure, take a **Test shot** to check it, then
-  *Start capturing*.
+  *Start capturing*. Setup also lists **every group on the device** — reopen an
+  old group to review/download it, or delete it outright (renaming a group never
+  strands its files).
 - **Capture** (the fast loop): large last shot, a glanceable exposure verdict,
   and a running count. Keyboard-first for high volume.
 - **Review** (after): thumbnail grid with exposure flags, filter to flagged
-  frames, caption/delete/download individual images, or download the whole
-  group as a zip.
+  frames, caption/delete/download individual images, download the whole group
+  as a zip, or clear the group once it's safely downloaded.
 
 ### Keyboard shortcuts
 
@@ -130,8 +135,10 @@ exposure aid. Focus once, manually, on the film plane. Full rationale in
 
 Instead of pressing Capture, you can wire a 3-pin optical sensor (IR break-beam
 or photo-interrupter) so a slide dropping into position fires the shot
-automatically (`trigger.py`, off by default). It pairs with auto slide-advance:
-advance → beam blocked → capture → repeat.
+automatically (`trigger.py`, off by default). This is how the author's slide
+collection was actually scanned: a continuously running rotary pusher feeds
+slides, the arm trips the sensor each revolution, and the rig captures
+hands-free for hours — hundreds of slides per session with no browser open.
 
 ### Wiring — Raspberry Pi 40-pin header
 
@@ -208,15 +215,22 @@ correction.
 ## Roadmap
 
 - [x] Camera tethering + full-res capture over USB
-- [x] Web capture app: presets, exposure aid, captions, review/cull, export
-- [x] Raspberry Pi appliance deploy kit (`deploy/`) — untested on hardware
+- [x] Web capture app: presets, exposure aid, captions, review/cull, export,
+      group management
+- [x] Raspberry Pi appliance deploy kit (`deploy/`) — proven on hardware
 - [x] CI image build (GitHub Actions → flashable `.img` on tag/Release)
 - [ ] Speed up CI: native ARM runners instead of QEMU (~30 min → a few min);
       gated on cost for a private repo, so revisit when public
-- [ ] Physical rig: light pad, film holder with registration, camera mount
-- [ ] First hardware shakedown of the Pi deploy (Comitup AP flow, real capture)
+- [x] Physical rig: high-CRI backlight, rotary slide pusher (continuously
+      running motor, manual speed control), optical break-beam sensor
+- [x] First hardware shakedown of the Pi deploy (Comitup AP flow, real capture)
 - [x] Web-based self-update: a button in the UI that pulls the latest release
       and restarts the service (no SSH needed on the appliance)
+- [x] **Production: the author's 35mm slide collection digitized end-to-end** —
+      multi-hour hands-free sensor-triggered sessions on the appliance, with
+      digital brightness correction cleaning up the dense frames
+- [ ] Negatives production run: presets + RAW pipeline are built but haven't
+      been used in anger yet
 - [ ] Security hardening before going public: attack-surface review of the web
       app, remove SSH from the appliance (reflash-on-failure is the recovery
       path), scope sudo to a command allowlist, default-deny inbound firewall
@@ -227,8 +241,12 @@ correction.
       (`nmcli`/Comitup API) and drop `comitup-web`, so one service on one port
       does setup + scanning (also shrinks attack surface). Until then, an
       `slidescanner.local` QR-code bookmark hides the `:8080`.
-- [ ] Auto slide-advance (`advance.py`): stub + API done; needs hardware
-      bring-up (motor + stop-switch or stepper) and a UI toggle in Setup
-- [ ] Optical-sensor capture trigger (`trigger.py`): module + API + Setup UI
-      done (configurable polarity, `gpiod` in the image); needs hardware bring-up
-- [ ] Automated XY gantry (GRBL) for hands-free batch scanning (`scanner.py`)
+- [x] Optical-sensor capture trigger (`trigger.py`): proven in production —
+      it ran the entire slide-collection scan
+- [ ] Auto slide-advance (`advance.py`): stub + API done, but the production
+      rig ended up not needing it — a continuously running motor with a manual
+      speed controller feeds slides and the sensor does the rest. Kept for a
+      future Pi-controlled feeder.
+- [ ] Automated XY gantry (GRBL) for batch-scanning negative strips
+      (`scanner.py`) — the likely next phase if negatives get the same
+      hands-free treatment
